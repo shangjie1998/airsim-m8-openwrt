@@ -86,7 +86,7 @@ sh /opt/airsim-m8/uninstall.sh
 | 现象 | 说明 |
 |---|---|
 | 双卡区分卡槽 | **已支持**（0.1.0.26 起）：来电通知正文带 `卡槽: 卡1/卡2`，本机号取来电那张卡。做法是对在位卡槽逐个 `AT+CLCC`（`MU300_SIM_SLOT=0/1`），非 Agent 路径；Agent 的 `AT` 走 `mmcli` 只看得见主卡 |
-| 通话约 50 秒后断链 | `aplay` 报 `pcm_write I/O error`，上下行帧计数冻结，DSP 开关自动回落；未解 |
+| 通话结束瞬间 `aplay` 报 `pcm_write: I/O error` | **不是故障**：对方挂断时语音路由被释放，桥侧写最后一帧拿到的就是 I/O error，属正常收尾。已按挂断流程处理（`AT+CLCC` 里通话消失即停流），不再当成中途断流 |
 | 屏幕接听来电采不到下行 | 原生拨号器接听态独占采集路由（`arecord` 直接 I/O error）；改用 iOS 端接听即可 |
 | 偶尔闪白屏 | 面板 ESD 看门狗循环复位（`esd check failed` + `esd recovery end`），内核侧无软件开关，与安装包无关 |
 | iOS 已配对设备仍显示旧名 | 设备名缓存在 App 本地，改名后需删设备重新配对 |

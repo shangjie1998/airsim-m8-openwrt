@@ -321,7 +321,7 @@ daemon `/status.version` 与 Agent `version`（`0.4.7-mu300.<VERSION>`）同串�
 
 | 现象 | 原因 | 状态 |
 |---|---|---|
-| 通话约 50 秒后 `aplay` 报 `pcm_write: I/O error`，上下行计数冻结，两个 DSP 开关自动回 `off` | 厂商原生语音栈在通话中途抢回 voice 路由 | 未解 |
+| 通话结束那一瞬 `aplay` 报 `pcm_write: I/O error`，上下行计数冻结，两个 DSP 开关自动回 `off` | **不是故障，是收尾**：对方挂断后语音路由被释放，桥侧写最后一帧必然拿到 I/O error。此前误判成"通话约 50 秒断链"，实际与通话时长无关 | 已解决：按挂断流程处理（`AT+CLCC` 里通话消失即停流），不再当错误 |
 | 在**手机屏幕上接听**的来电，采集拿不到下行（`arecord` I/O error / 全零帧）；桥自己发起的通话正常 | 原生接听态独占了采集路由 | 未解，改用 iPhone 接听可正常双向 |
 | 屏幕偶尔闪白/黑屏 | 面板 ESD 看门狗循环复位（内核日志 `esd check failed, read value = 0x00`），`/sys/kernel/debug` 下无任何 `*esd*` 节点 | 无软件开关，断电重启恢复 |
 | LuCI 显示"未注册"，但 ModemManager 报 connected | 纯展示差异 | 已知 |
