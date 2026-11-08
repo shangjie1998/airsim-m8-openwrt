@@ -9,7 +9,7 @@
 
 - 上游项目：[kai-wu-cortex/airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)
 - 本适配仓库：<https://github.com/shangjie1998/airsim-m8-openwrt>
-- 当前已验收版本：**`0.1.0.25-r22-m8`**（详见 [版本口径](#版本口径)）
+- 当前已验收版本：**`0.1.0.26-r22-m8`**（详见 [版本口径](#版本口径)）
 
 > 感谢上游作者 **kai-wu-cortex** 开源 [airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)。
 > 本仓库的 daemon、Agent、LuCI 页面、AirSIM 协议实现全部来自上游；这里做的是"让同一套东西在
@@ -214,15 +214,21 @@ scts: <SCTS 时间串>
 - 页面：LuCI → 服务 → AirSIM → **来电通知**，文件 `/www/luci-static/resources/view/airsim/call.js`；
   卡片结构、字段名、历史表格都照上游原生短信转发页（`mud-card` / `mud-fwd-*`）复制，不自创版式
 - 后端：`/usr/libexec/rpcd/airsim-call` 提供 `call_get` / `call_status` / `call_save` / `call_test` / `call_clear`
-- 轮询：`/usr/libexec/airsim-m8/call-forward` 每 `poll` 秒（默认 2）用 `mu300-at` 读一次 `AT+CLCC`，
-  按 `dir` / `stat` 判状态：`dir=1` 来电、`stat 4/5` 振铃、`stat 0` 通话中
+- 轮询：`/usr/libexec/airsim-m8/call-forward` 每 `poll` 秒（默认 2）**对在位卡槽逐个**执行
+  `MU300_SIM_SLOT=<n> /usr/libexec/unisoc-modem/at AT+CLCC`，按 `dir` / `stat` 判状态：
+  `dir=1` 来电、`stat 4/5` 振铃、`stat 0` 通话中；**哪一槽返回了 `+CLCC` 就说明这通电话落在哪张卡**
+  （一条 `AT+CLCC` 只能看到一张卡，所以两槽必须分别查；Agent 的 `AT` 走 `mmcli`，只对着主卡，
+  副卡来电它根本看不见，不能作为数据源）
 - 事件：`ringing` → `answered` → `ended` / `missed`，按各自开关投递；结果写
   `/opt/airsim-m8/data/call-forward-history`（30 条）
+- 投递失败（通话起呼瞬间数据面常会短暂中断，`http_code=000`）不丢事件：压入
+  `/opt/airsim-m8/data/call-forward-queue`，之后每轮补发一条，超 10 分钟未成功才丢弃
 - 配置：`uci airsim-call-forward.forward` —— `url`、`method`、`content_type`、`timeout`、`poll`、
   `expect`、`notify_ringing`、`notify_answered`、`notify_ended`、`notify_missed`、`body`
-- 设备信息：本机号取 Agent `/api/status` 的 `phone_number`，运营商与信号取 `mmcli`，
-  开机时长读 `/proc/uptime`；整组缓存 5 分钟（`/tmp/call-forward.info`），**通话期间不碰 modem**
-- 正文占位符：`{number}` `{time}` `{tag}` `{self}` `{operator}` `{signal}` `{uptime}` `{device}`；
+- 设备信息：本机号、在位卡槽与各槽本机号（`AT+CCID` / `AT+CNUM`）、运营商与信号、开机时长
+  整组缓存 5 分钟（`/tmp/call-forward.info`），**通话期间不做这些查询**
+- 正文占位符：`{number}` `{time}` `{tag}` `{slot}` `{self}` `{operator}` `{signal}` `{uptime}` `{device}`；
+  `{slot}` 展开为 `卡1` / `卡2`，`{self}` 取**来电那张卡**的本机号；
   `{tag}` 展开为 `#CALL #CALL_IN` / `#CALL_ANSWER` / `#CALL_END` / `#CALL_MISSED`
 - 默认**关闭**（`enabled=0`）；页面开关即生效，不重启服务，也不影响短信转发
 
@@ -238,12 +244,12 @@ scts: <SCTS 时间串>
 
 ```sh
 # 1. 把安装包传到设备 /tmp（scp 直写系统路径会失败，必须先落 /tmp）
-scp "airsim-m8-0.1.0.25-r22-m8.tar.gz" root@192.168.9.1:/tmp/
+scp "airsim-m8-0.1.0.26-r22-m8.tar.gz" root@192.168.9.1:/tmp/
 
 # 2. 设备侧解包安装
 ssh root@192.168.9.1
 mkdir -p /tmp/m8pkg && cd /tmp/m8pkg
-tar xzf "/tmp/airsim-m8-0.1.0.25-r22-m8.tar.gz" -C /tmp/m8pkg
+tar xzf "/tmp/airsim-m8-0.1.0.26-r22-m8.tar.gz" -C /tmp/m8pkg
 sh install.sh
 ```
 
@@ -307,9 +313,11 @@ daemon `/status.version` 与 Agent `version`（`0.4.7-mu300.<VERSION>`）同串�
 
 ## 8. 已知限制（都能复现，已记录，不是"偶发"）
 
-> **双卡未解决**：两张卡同时插时，设备版无法区分来电落在哪张卡（Agent 的 `callRecord` 无卡槽字段），
-> 通知里只能给号码和时间，给不出卡槽。当前只在单卡（联通 `46001`）上验证过。
-> 上游 PR 版已按 `MU300_SIM_SLOT` 逐卡查询 `AT+CLCC`，设备版待跟进。
+> **双卡已支持（0.1.0.26 起）**：两张卡同时插时，来电通知能标出落在哪张卡（正文 `卡槽: 卡1/卡2`，
+> `{self}` 取来电那张卡的本机号）。做法是对在位卡槽逐个 `MU300_SIM_SLOT=<n> ... AT+CLCC`，谁返回谁就是。
+> 真机验证：卡槽0 来电 `1,1,4,...` 只出现在 slot0；卡槽1 来电只出现在 slot1，通知均 `sent|200`。
+> 注意：**Agent 的 `/api/calls/status` 看不到副卡来电**（它的 `AT` 走 `mmcli`，只对一个 modem 生效），
+> 所以来电通知不再以 Agent 为数据源，Agent 仅作为 `at` 适配层缺失时的兜底（此时没有卡槽信息）。
 
 | 现象 | 原因 | 状态 |
 |---|---|---|

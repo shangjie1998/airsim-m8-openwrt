@@ -4,8 +4,15 @@
 # history. The channel (URL / method / content type / timeout / headers) is
 # inherited from the SMS forwarder unless this config sets its own.
 #
-# The source of truth is the AirSIM agent's local call view, so this never talks
-# to the modem and cannot disturb the native call stack.
+# Two call sources, best first:
+#   1. per-slot AT+CLCC through the upstream adapter
+#      (/usr/libexec/unisoc-modem/at). One query only ever covers one slot, so
+#      both slots are polled; whichever answers is the card the call landed on.
+#      This is the only source that can see the second SIM at all: the agent
+#      relays its AT through mmcli, and ModemManager exposes a single modem,
+#      i.e. the primary card.
+#   2. the AirSIM agent's /api/calls/status, used only when the adapter is
+#      missing. It cannot report a slot, so {slot} stays empty there.
 set -u
 
 BASE=/opt/airsim-m8/data
@@ -13,7 +20,12 @@ STATE_FILE="$BASE/call-forward.state"
 HISTORY_FILE="$BASE/call-forward-history"
 INFO_FILE=/tmp/call-forward.info
 BODY_FILE=/tmp/call-forward.body
+QUEUE_FILE="$BASE/call-forward-queue"
+QUEUE_MAX=20
+QUEUE_TTL=600
 AGENT_URL=http://127.0.0.1:8575/api/calls/status
+AT_BIN=/usr/libexec/unisoc-modem/at
+SLOTS="0 1"
 DEVICE_NAME=VIPME-M8
 HISTORY_MAX=30
 
@@ -45,8 +57,19 @@ event_tag() {
 	esac
 }
 
-# Device facts change slowly; the cache keeps every call cheap and keeps the
-# modem untouched while a call is in progress.
+# Slot 0 is the first card tray position, so it reads as 卡1 to a human.
+slot_label() {
+	case "${1:-}" in
+	'') printf '' ;;
+	0)  printf '卡1' ;;
+	1)  printf '卡2' ;;
+	*)  printf '卡%s' "$1" ;;
+	esac
+}
+
+# Device facts change slowly; the cache keeps every call cheap. This is also
+# where slot presence and each slot's own number are probed, so the poll loop
+# only needs the cheap CLCC query per tick.
 collect_info() {
 	_st=$(wget -q -T 3 -O- http://127.0.0.1:8575/api/status 2>/dev/null)
 	_self=$(printf '%s' "$_st" | sed -n 's/.*"phone_number":"\([^"]*\)".*/\1/p')
@@ -64,8 +87,34 @@ collect_info() {
 		_signal=${_quality:-未知}
 	fi
 	_uptime=$(awk '{s=int($1); printf "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60}' /proc/uptime 2>/dev/null)
+
+	# Which trays hold a card, and what each tray's own number is. Both need one
+	# AT round-trip per slot, so they ride along with the slow refresh only.
+	_present=
+	_self0=
+	_self1=
+	if [ -x "$AT_BIN" ]; then
+		for _s in $SLOTS; do
+			if MU300_SIM_SLOT=$_s "$AT_BIN" -t 3 "AT+CCID" 2>/dev/null | grep -q 'CCID'; then
+				_present="$_present $_s"
+				_n=$(MU300_SIM_SLOT=$_s "$AT_BIN" -t 3 "AT+CNUM" 2>/dev/null |
+					sed -n 's/.*"\(+\{0,1\}[0-9]\{5,\}\)".*/\1/p' | head -1)
+				case "$_n" in
+				86*) _n="+$_n" ;;
+				esac
+				case "$_s" in
+				0) _self0=$_n ;;
+				1) _self1=$_n ;;
+				esac
+			fi
+		done
+	fi
+
 	cat > "$INFO_FILE" <<EOF
 INFO_SELF='${_self:-未知}'
+INFO_SELF_0='${_self0:-}'
+INFO_SELF_1='${_self1:-}'
+INFO_SLOTS='${_present}'
 INFO_OPERATOR='${_operator:-未知}'
 INFO_SIGNAL='${_signal:-未知}'
 INFO_UPTIME='${_uptime:-00:00:00}'
@@ -77,6 +126,7 @@ refresh_info() {
 	[ -f "$INFO_FILE" ] && . "$INFO_FILE" 2>/dev/null
 	_age=$(( $(date +%s) - ${INFO_TS:-0} ))
 	if [ "$_age" -ge 300 ]; then collect_info; fi
+	INFO_SLOTS=${INFO_SLOTS:-0}
 	return 0
 }
 
@@ -87,9 +137,10 @@ tpl() {
 		| sed "s|{number}|$3|g" \
 		| sed "s|{state}|$4|g" \
 		| sed "s|{direction}|$5|g" \
+		| sed "s|{slot}|$(slot_label "${7:-}")|g" \
 		| sed "s|{time}|$6|g" \
 		| sed "s|{device}|$DEVICE_NAME|g" \
-		| sed "s|{self}|${INFO_SELF:-}|g" \
+		| sed "s|{self}|${SEND_SELF:-${INFO_SELF:-}}|g" \
 		| sed "s|{operator}|${INFO_OPERATOR:-}|g" \
 		| sed "s|{signal}|${INFO_SIGNAL:-}|g" \
 		| sed "s|{uptime}|${INFO_UPTIME:-}|g"
@@ -105,11 +156,20 @@ expect_match() {
 	[ "$_got" = "$_want" ]
 }
 
-send_event() {  # send_event <kind> <number> <state> <direction>
-	_event=$1; _number=$2; _state=$3; _direction=$4
-	[ -n "${_url:-}" ] || { record "$_event" invalid_destination ""; return 1; }
+send_event() {  # send_event <kind> <number> <state> <direction> <slot>
+	_event=$1; _number=$2; _state=$3; _direction=$4; _slot=${5:-}
+	SEND_SELF=
+	if [ -n "$_slot" ]; then
+		eval "SEND_SELF=\"\${INFO_SELF_$_slot:-}\""
+	fi
+	[ -n "$SEND_SELF" ] || SEND_SELF=${INFO_SELF:-}
+	[ -n "${_url:-}" ] || {
+		record "$_event" invalid_destination ""
+		SEND_SELF=
+		return 1
+	}
 
-	_body=$(tpl "${_body_tpl:-}" "$_event" "$_number" "$_state" "$_direction" "$(date '+%Y-%m-%d %H:%M:%S')")
+	_body=$(tpl "${_body_tpl:-}" "$_event" "$_number" "$_state" "$_direction" "$(date '+%Y-%m-%d %H:%M:%S')" "$_slot")
 
 	set -- -s -m "${_timeout:-12}" -o "$BODY_FILE" -w '%{http_code}'
 	[ "${_method:-POST}" = GET ] || set -- "$@" -X "$_method"
@@ -138,11 +198,61 @@ send_event() {  # send_event <kind> <number> <state> <direction>
 
 	record "$_event" "$_result" "$_code"
 	if [ "$_result" = sent ]; then
-		log "forwarded $_event ${_number:-unknown} ($_code)"
+		log "forwarded $_event ${_number:-unknown} slot${_slot:-none} ($_code)"
+		SEND_SELF=
 		return 0
 	fi
-	log "forward FAILED $_event ${_number:-unknown} (${_code:-no-connection}) $_result"
+	log "forward FAILED $_event ${_number:-unknown} slot${_slot:-none} (${_code:-no-connection}) $_result"
+	# A ringing call often starts before the data path is back up, so a failed
+	# delivery is kept and retried instead of dropped.
+	if [ -z "${_NOQUEUE:-}" ]; then
+		queue_add "$_event" "$_number" "$_state" "$_direction" "$_slot"
+	fi
+	SEND_SELF=
 	return 1
+}
+
+queue_add() {  # queue_add <kind> <number> <state> <direction> <slot>
+	printf '%s\n' "$(date +%s)|$1|$2|$3|$4|${5:-}" >> "$QUEUE_FILE" 2>/dev/null
+	_q=$(wc -l < "$QUEUE_FILE" 2>/dev/null || echo 0)
+	if [ "${_q:-0}" -gt "$QUEUE_MAX" ]; then
+		tail -n "$QUEUE_MAX" "$QUEUE_FILE" > "$QUEUE_FILE.new" 2>/dev/null &&
+			mv "$QUEUE_FILE.new" "$QUEUE_FILE"
+	fi
+}
+
+queue_drop_first() {
+	sed '1d' "$QUEUE_FILE" > "$QUEUE_FILE.new" 2>/dev/null &&
+		if [ -s "$QUEUE_FILE.new" ]; then
+			mv "$QUEUE_FILE.new" "$QUEUE_FILE"
+		else
+			rm -f "$QUEUE_FILE.new" "$QUEUE_FILE"
+		fi
+}
+
+# One queued delivery per poll tick: keeps the call poll on schedule while a
+# backlog drains, and drops entries that are too old to be useful.
+queue_flush_one() {
+	[ -s "$QUEUE_FILE" ] || return 0
+	_qline=$(head -1 "$QUEUE_FILE" 2>/dev/null)
+	[ -n "$_qline" ] || return 0
+	_qts=$(printf '%s' "$_qline" | cut -d'|' -f1)
+	_qage=$(( $(date +%s) - ${_qts:-0} ))
+	if [ "${_qage:-0}" -gt "$QUEUE_TTL" ]; then
+		log "drop stale queued event ($_qage""s old)"
+		queue_drop_first
+		return 0
+	fi
+	_qkind=$(printf '%s' "$_qline" | cut -d'|' -f2)
+	_qnum=$(printf '%s' "$_qline" | cut -d'|' -f3)
+	_qstate=$(printf '%s' "$_qline" | cut -d'|' -f4)
+	_qdir=$(printf '%s' "$_qline" | cut -d'|' -f5)
+	_qslot=$(printf '%s' "$_qline" | cut -d'|' -f6)
+	if _NOQUEUE=1 send_event "$_qkind" "$_qnum" "$_qstate" "$_qdir" "$_qslot"; then
+		log "queued event delivered after retry"
+		queue_drop_first
+	fi
+	return 0
 }
 
 load_config() {
@@ -167,7 +277,7 @@ load_config() {
 	[ -n "$_ctype" ] || _ctype=application/json
 	[ -n "$_timeout" ] || _timeout=12
 	[ -n "$_poll" ] || _poll=2
-	[ -n "$_body_tpl" ] || _body_tpl='{"title":"来自M8-来电","content":"来电号码: {number}\n来电时间: {time}\n{tag}\n\n本机号码: {self}\n开机时长: {uptime}\n运营商: {operator}\n信号: {signal}","template":"txt"}'
+	[ -n "$_body_tpl" ] || _body_tpl='{"title":"来自M8-来电","content":"来电号码: {number}\n来电时间: {time}\n{tag}\n卡槽: {slot}\n\n本机号码: {self}\n开机时长: {uptime}\n运营商: {operator}\n信号: {signal}","template":"txt"}'
 }
 
 notify_enabled() {
@@ -176,7 +286,35 @@ notify_enabled() {
 	[ "$_v" = 1 ]
 }
 
-poll_once() {
+# One CLCC line per slot; the answering slot owns the call. Field order is
+# <idx>,<dir>,<stat>,<mode>,<mpty>,<number>,<type>.
+poll_at() {
+	_cur=
+	for _s in ${INFO_SLOTS:-0}; do
+		_r=$(MU300_SIM_SLOT=$_s "$AT_BIN" -t 3 "AT+CLCC" 2>/dev/null | sed -n 's/^+CLCC: *//p' | head -1)
+		[ -n "$_r" ] || continue
+		_set=$(printf '%s' "$_r" | cut -d, -f2)
+		_sst=$(printf '%s' "$_r" | cut -d, -f3)
+		_sidx=$(printf '%s' "$_r" | cut -d, -f1)
+		_snum=$(printf '%s' "$_r" | cut -d, -f6 | tr -d '"')
+		case "$_sst" in
+		4|5) _st=ringing ;;
+		0)   _st=active ;;
+		*)   continue ;;
+		esac
+		case "$_set" in
+		1) _sdir=incoming ;;
+		0) _sdir=outgoing ;;
+		*) _sdir= ;;
+		esac
+		_cur="$_s|$_sidx|$_st|$_snum|$_sdir"
+		break
+	done
+	apply_state "$_cur"
+}
+
+# Agent view: primary card only, no slot. Kept as the fallback source.
+poll_agent() {
 	_json=$(wget -q -T 3 -O- "$AGENT_URL" 2>/dev/null) || return 0
 	[ -n "$_json" ] || return 0
 
@@ -188,33 +326,67 @@ poll_once() {
 		_number=$(field "$_act" number)
 		_direction=$(field "$_act" direction)
 	fi
+	case "$_state" in
+	incoming|ringing) apply_state "-|$_id|ringing|$_number|$_direction" ;;
+	active|answered)  apply_state "-|$_id|active|$_number|$_direction" ;;
+	*)                apply_state "" ;;
+	esac
+}
 
-	# Keep the direction too: on hangup the active view is already empty, and a
-	# template that prints {direction} must not go blank.
-	_cur="$_id|$_state|$_number|$_direction"
+# apply_state <slot|idx|state|number|direction>  (empty means no call)
+apply_state() {
+	_cur=$1
 	_prev=$(cat "$STATE_FILE" 2>/dev/null)
+	# A leftover 4-field state file predates slot tracking; drop it instead of
+	# firing one bogus ended event on upgrade.
+	if [ -n "$_prev" ] && [ "$(printf '%s' "$_prev" | awk -F'|' '{print NF}')" != 5 ]; then
+		_prev=
+	fi
 	[ "$_cur" = "$_prev" ] && return 0
+
+	_prev_slot=; _prev_state=; _prev_number=; _prev_dir=
+	if [ -n "$_prev" ]; then
+		_prev_slot=$(printf '%s' "$_prev" | cut -d'|' -f1)
+		_prev_state=$(printf '%s' "$_prev" | cut -d'|' -f3)
+		_prev_number=$(printf '%s' "$_prev" | cut -d'|' -f4)
+		_prev_dir=$(printf '%s' "$_prev" | cut -d'|' -f5)
+	fi
+
 	printf '%s' "$_cur" > "$STATE_FILE" 2>/dev/null
 
-	if [ -z "$_state" ]; then
-		_old_state=$(printf '%s' "$_prev" | cut -d'|' -f2)
-		_old_number=$(printf '%s' "$_prev" | cut -d'|' -f3)
-		_old_dir=$(printf '%s' "$_prev" | cut -d'|' -f4)
-		[ -n "$_old_state" ] || return 0
-		case "$_old_state" in
+	if [ -z "$_cur" ]; then
+		[ -n "$_prev_state" ] || return 0
+		case "$_prev_state" in
 		# Never answered: ringing on either naming of the inbound state.
-		incoming|ringing) notify_enabled missed && send_event missed "$_old_number" ended "$_old_dir" ;;
-		*)                notify_enabled ended && send_event ended "$_old_number" ended "$_old_dir" ;;
+		ringing) if notify_enabled missed; then send_event missed "$_prev_number" ended "$_prev_dir" "$_prev_slot"; fi ;;
+		*)       if notify_enabled ended; then send_event ended "$_prev_number" ended "$_prev_dir" "$_prev_slot"; fi ;;
 		esac
 		return 0
 	fi
 
-	case "$_state" in
-	# The AirSIM agent names the inbound state "incoming"; older builds said
-	# "ringing". Both mean the same thing to a notification reader.
-	incoming|ringing) notify_enabled ringing && send_event ringing "$_number" "$_state" "$_direction" ;;
-	active|answered)  notify_enabled answered && send_event answered "$_number" "$_state" "$_direction" ;;
+	_cur_slot=$(printf '%s' "$_cur" | cut -d'|' -f1)
+	_cur_state=$(printf '%s' "$_cur" | cut -d'|' -f3)
+	_cur_number=$(printf '%s' "$_cur" | cut -d'|' -f4)
+	_cur_dir=$(printf '%s' "$_cur" | cut -d'|' -f5)
+
+	case "$_cur_state" in
+	ringing)
+		[ "$_prev_state" = ringing ] && return 0
+		if notify_enabled ringing; then send_event ringing "$_cur_number" "$_cur_state" "$_cur_dir" "$_cur_slot"; fi
+		;;
+	active)
+		[ "$_prev_state" = active ] && return 0
+		if notify_enabled answered; then send_event answered "$_cur_number" "$_cur_state" "$_cur_dir" "$_cur_slot"; fi
+		;;
 	esac
+}
+
+poll_once() {
+	if [ -x "$AT_BIN" ]; then
+		poll_at
+	else
+		poll_agent
+	fi
 }
 
 run() {
@@ -223,6 +395,7 @@ run() {
 			load_config
 			refresh_info
 			poll_once
+			queue_flush_one
 			sleep "$_poll"
 		else
 			# Disabled: stay alive so enabling it needs no service restart.
@@ -240,7 +413,8 @@ run)
 test)
 	load_config
 	refresh_info
-	send_event test "+8613166773059" ringing incoming
+	SEND_SELF=${INFO_SELF:-}
+	_NOQUEUE=1 send_event test "+8613166773059" ringing incoming 0
 	;;
 *)
 	echo "usage: call-forward {run|test}" >&2
