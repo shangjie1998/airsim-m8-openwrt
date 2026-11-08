@@ -8,6 +8,10 @@
      "settings_get",
      "diagnostics",
      "updates_status"
+    ],
+    "airsim-call": [
+     "call_get",
+     "call_status"
     ]
    }
   },
@@ -30,6 +34,11 @@
      "sms_show",
      "sms_send",
      "sms_job"
+    ],
+    "airsim-call": [
+     "call_save",
+     "call_test",
+     "call_clear"
     ]
    }
   }

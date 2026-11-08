@@ -62,11 +62,12 @@ mkdir -p /usr/libexec/rpcd /usr/share/luci/menu.d /usr/share/rpcd/acl.d \
 	/www/luci-static/resources/view/airsim /etc/config
 cp "$HERE/luci/usr/libexec/rpcd/airsim" /usr/libexec/rpcd/airsim
 cp "$HERE/luci/usr/libexec/rpcd/airsim-sms" /usr/libexec/rpcd/airsim-sms
-chmod 755 /usr/libexec/rpcd/airsim /usr/libexec/rpcd/airsim-sms
+cp "$HERE/luci/usr/libexec/rpcd/airsim-call" /usr/libexec/rpcd/airsim-call
+chmod 755 /usr/libexec/rpcd/airsim /usr/libexec/rpcd/airsim-sms /usr/libexec/rpcd/airsim-call
 cp "$HERE/luci/usr/share/luci/menu.d/luci-app-airsim.json" /usr/share/luci/menu.d/luci-app-airsim.json
 cp "$HERE/luci/usr/share/rpcd/acl.d/luci-app-airsim.json" /usr/share/rpcd/acl.d/luci-app-airsim.json
 chmod 644 /usr/share/luci/menu.d/luci-app-airsim.json /usr/share/rpcd/acl.d/luci-app-airsim.json
-for f in overview.js manage.js sms.js overview.css; do
+for f in overview.js manage.js sms.js call.js overview.css; do
 	cp "$HERE/luci/www/luci-static/resources/view/airsim/$f" "/www/luci-static/resources/view/airsim/$f"
 	chmod 644 "/www/luci-static/resources/view/airsim/$f"
 done
@@ -77,6 +78,19 @@ cp "$HERE/luci/etc/config/airsim" /etc/config/airsim
 
 cp "$HERE/airsim-m8.init" /etc/init.d/airsim-m8
 chmod 755 /etc/init.d/airsim-m8
+
+# Call forwarding to a webhook (uci airsim-call-forward). Ships disabled; an
+# existing config keeps whatever URL the user already set.
+mkdir -p /usr/libexec/airsim-m8
+cp "$HERE/call-forward" /usr/libexec/airsim-m8/call-forward
+chmod 755 /usr/libexec/airsim-m8/call-forward
+cp "$HERE/airsim-call-forward.init" /etc/init.d/airsim-call-forward
+chmod 755 /etc/init.d/airsim-call-forward
+if [ ! -f /etc/config/airsim-call-forward ]; then
+	cp "$HERE/airsim-call-forward.config" /etc/config/airsim-call-forward
+	chmod 644 /etc/config/airsim-call-forward
+fi
+
 cp "$HERE/uninstall.sh" /opt/airsim-m8/uninstall.sh
 chmod 755 /opt/airsim-m8/uninstall.sh
 VERSION=$(cat "$HERE/VERSION" 2>/dev/null || echo unknown)
@@ -93,6 +107,8 @@ done
 
 /etc/init.d/airsim-m8 enable
 /etc/init.d/airsim-m8 start
+/etc/init.d/airsim-call-forward enable
+/etc/init.d/airsim-call-forward start
 sleep 3
 
 say "== firmware file guard (firmware must stay untouched)"

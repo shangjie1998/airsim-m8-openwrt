@@ -1,0 +1,243 @@
+#!/bin/sh
+# Forwards call events to one webhook. Same shape as the native SMS forwarder
+# (uci e5-notify.forward): uci config, curl delivery, body template, delivery
+# history. The channel (URL / method / content type / timeout / headers) is
+# inherited from the SMS forwarder unless this config sets its own.
+#
+# The source of truth is the AirSIM agent's local call view, so this never talks
+# to the modem and cannot disturb the native call stack.
+set -u
+
+BASE=/opt/airsim-m8/data
+STATE_FILE="$BASE/call-forward.state"
+HISTORY_FILE="$BASE/call-forward-history"
+INFO_FILE=/tmp/call-forward.info
+BODY_FILE=/tmp/call-forward.body
+AGENT_URL=http://127.0.0.1:8575/api/calls/status
+DEVICE_NAME=VIPME-M8
+HISTORY_MAX=30
+
+log() { logger -t airsim-call-forward "$*" 2>/dev/null || :; }
+
+cfg() { uci -q get "airsim-call-forward.forward.$1" 2>/dev/null; }
+sms_cfg() { uci -q get "e5-notify.forward.$1" 2>/dev/null; }
+
+field() { printf '%s' "$1" | sed -n 's/.*"'"$2"'":"\([^"]*\)".*/\1/p'; }
+
+record() {  # record <kind> <result> <http_code>
+	_line="$(date +%s)|$1|$2|${3:-}"
+	printf '%s\n' "$_line" >> "$HISTORY_FILE" 2>/dev/null
+	_total=$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)
+	if [ "${_total:-0}" -gt "$HISTORY_MAX" ]; then
+		# Keep only the newest rows; the file carries no phone numbers.
+		tail -n "$HISTORY_MAX" "$HISTORY_FILE" > "$HISTORY_FILE.new" 2>/dev/null &&
+			mv "$HISTORY_FILE.new" "$HISTORY_FILE"
+	fi
+}
+
+# Event names a notification reader can filter on, same style as the SMS side.
+event_tag() {
+	case "$1" in
+	ringing)  printf '#CALL #CALL_IN' ;;
+	answered) printf '#CALL #CALL_ANSWER' ;;
+	ended)    printf '#CALL #CALL_END' ;;
+	missed)   printf '#CALL #CALL_MISSED' ;;
+	esac
+}
+
+# Device facts change slowly; the cache keeps every call cheap and keeps the
+# modem untouched while a call is in progress.
+collect_info() {
+	_st=$(wget -q -T 3 -O- http://127.0.0.1:8575/api/status 2>/dev/null)
+	_self=$(printf '%s' "$_st" | sed -n 's/.*"phone_number":"\([^"]*\)".*/\1/p')
+	_dbm=$(printf '%s' "$_st" | sed -n 's/.*"signal_dbm":\([^,}]*\).*/\1/p' | tr -d '"')
+	_mm=$(mmcli -m any 2>/dev/null)
+	[ -n "$_self" ] || _self=$(printf '%s' "$_mm" | sed -n 's/.*own: *//p' | head -1 | tr -d ' ')
+	_operator=$(printf '%s' "$_mm" | sed -n 's/.*operator name: *//p' | head -1)
+	_quality=$(printf '%s' "$_mm" | sed -n 's/.*signal quality: *\([0-9]*\)%.*/\1%/p' | head -1)
+	_rsrp=$(mmcli -m any --signal-get 2>/dev/null | sed -n 's/.*rsrp: *\(-*[0-9.]*\) *dBm.*/\1/p' | head -1)
+	if [ -n "${_dbm:-}" ] && [ "$_dbm" != null ]; then
+		_signal="${_dbm}dBm"
+	elif [ -n "$_rsrp" ]; then
+		_signal="$(printf '%s' "$_rsrp" | awk '{printf "%d", $1}')dBm"
+	else
+		_signal=${_quality:-未知}
+	fi
+	_uptime=$(awk '{s=int($1); printf "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60}' /proc/uptime 2>/dev/null)
+	cat > "$INFO_FILE" <<EOF
+INFO_SELF='${_self:-未知}'
+INFO_OPERATOR='${_operator:-未知}'
+INFO_SIGNAL='${_signal:-未知}'
+INFO_UPTIME='${_uptime:-00:00:00}'
+INFO_TS='$(date +%s)'
+EOF
+}
+
+refresh_info() {
+	[ -f "$INFO_FILE" ] && . "$INFO_FILE" 2>/dev/null
+	_age=$(( $(date +%s) - ${INFO_TS:-0} ))
+	if [ "$_age" -ge 300 ]; then collect_info; fi
+	return 0
+}
+
+tpl() {
+	printf '%s' "$1" \
+		| sed "s|{tag}|$(event_tag "$2")|g" \
+		| sed "s|{event}|$2|g" \
+		| sed "s|{number}|$3|g" \
+		| sed "s|{state}|$4|g" \
+		| sed "s|{direction}|$5|g" \
+		| sed "s|{time}|$6|g" \
+		| sed "s|{device}|$DEVICE_NAME|g" \
+		| sed "s|{self}|${INFO_SELF:-}|g" \
+		| sed "s|{operator}|${INFO_OPERATOR:-}|g" \
+		| sed "s|{signal}|${INFO_SIGNAL:-}|g" \
+		| sed "s|{uptime}|${INFO_UPTIME:-}|g"
+}
+
+# expect_match <field=value> <response body>
+expect_match() {
+	_expect=$1
+	[ -n "$_expect" ] || return 0
+	_key=${_expect%%=*}
+	_want=${_expect#*=}
+	_got=$(printf '%s' "$2" | sed -n 's/.*"'"$_key"'":[[:space:]]*"\{0,1\}\(-\{0,1\}[0-9a-zA-Z]*\)"\{0,1\}.*/\1/p' | head -1)
+	[ "$_got" = "$_want" ]
+}
+
+send_event() {  # send_event <kind> <number> <state> <direction>
+	_event=$1; _number=$2; _state=$3; _direction=$4
+	[ -n "${_url:-}" ] || { record "$_event" invalid_destination ""; return 1; }
+
+	_body=$(tpl "${_body_tpl:-}" "$_event" "$_number" "$_state" "$_direction" "$(date '+%Y-%m-%d %H:%M:%S')")
+
+	set -- -s -m "${_timeout:-12}" -o "$BODY_FILE" -w '%{http_code}'
+	[ "${_method:-POST}" = GET ] || set -- "$@" -X "$_method"
+	if [ -n "${_headers:-}" ]; then
+		_old_ifs=$IFS
+		IFS='
+'
+		for _h in $_headers; do
+			[ -n "$_h" ] && set -- "$@" -H "$_h"
+		done
+		IFS=$_old_ifs
+	fi
+	set -- "$@" -H "Content-Type: ${_ctype:-application/json}"
+	set -- "$@" --data "$_body" "$_url"
+
+	_code=$(curl "$@" 2>/dev/null)
+	_resp=$(cat "$BODY_FILE" 2>/dev/null)
+
+	case "$_code" in
+	2*|3*) _result=sent ;;
+	*) _result=service_rejected ;;
+	esac
+	if [ "$_result" = sent ] && ! expect_match "${_expect:-}" "$_resp"; then
+		_result=service_answer_missing
+	fi
+
+	record "$_event" "$_result" "$_code"
+	if [ "$_result" = sent ]; then
+		log "forwarded $_event ${_number:-unknown} ($_code)"
+		return 0
+	fi
+	log "forward FAILED $_event ${_number:-unknown} (${_code:-no-connection}) $_result"
+	return 1
+}
+
+load_config() {
+	# Own channel first, SMS channel second: one webhook serves both.
+	_url=$(cfg url)
+	_method=$(cfg method)
+	_ctype=$(cfg content_type)
+	_timeout=$(cfg timeout)
+	_expect=$(cfg expect)
+	_headers=$(cfg headers)
+	_body_tpl=$(cfg body)
+	_poll=$(cfg poll)
+
+	[ -n "$_url" ] || _url=$(sms_cfg webhook_url)
+	[ -n "$_method" ] || _method=$(sms_cfg webhook_method)
+	[ -n "$_ctype" ] || _ctype=$(sms_cfg webhook_content_type)
+	[ -n "$_timeout" ] || _timeout=$(sms_cfg webhook_timeout)
+	[ -n "$_expect" ] || _expect=$(sms_cfg webhook_expect)
+	[ -n "$_headers" ] || _headers=$(sms_cfg webhook_headers)
+
+	[ -n "$_method" ] || _method=POST
+	[ -n "$_ctype" ] || _ctype=application/json
+	[ -n "$_timeout" ] || _timeout=12
+	[ -n "$_poll" ] || _poll=2
+	[ -n "$_body_tpl" ] || _body_tpl='{"title":"来自M8-来电","content":"来电号码: {number}\n来电时间: {time}\n{tag}\n\n本机号码: {self}\n开机时长: {uptime}\n运营商: {operator}\n信号: {signal}","template":"txt"}'
+}
+
+notify_enabled() {
+	_v=$(cfg "notify_$1")
+	[ -n "$_v" ] || _v=1
+	[ "$_v" = 1 ]
+}
+
+poll_once() {
+	_json=$(wget -q -T 3 -O- "$AGENT_URL" 2>/dev/null) || return 0
+	[ -n "$_json" ] || return 0
+
+	_act=$(printf '%s' "$_json" | sed -n 's/.*"active":{\([^}]*\)}.*/\1/p')
+	_id=; _state=; _number=; _direction=
+	if [ -n "$_act" ]; then
+		_id=$(field "$_act" id)
+		_state=$(field "$_act" state)
+		_number=$(field "$_act" number)
+		_direction=$(field "$_act" direction)
+	fi
+
+	_cur="$_id|$_state|$_number"
+	_prev=$(cat "$STATE_FILE" 2>/dev/null)
+	[ "$_cur" = "$_prev" ] && return 0
+	printf '%s' "$_cur" > "$STATE_FILE" 2>/dev/null
+
+	if [ -z "$_state" ]; then
+		_old_state=$(printf '%s' "$_prev" | cut -d'|' -f2)
+		_old_number=$(printf '%s' "$_prev" | cut -d'|' -f3)
+		[ -n "$_old_state" ] || return 0
+		case "$_old_state" in
+		ringing) notify_enabled missed && send_event missed "$_old_number" ended incoming ;;
+		*)       notify_enabled ended && send_event ended "$_old_number" ended "$_direction" ;;
+		esac
+		return 0
+	fi
+
+	case "$_state" in
+	ringing) notify_enabled ringing && send_event ringing "$_number" "$_state" "$_direction" ;;
+	active)  notify_enabled answered && send_event answered "$_number" "$_state" "$_direction" ;;
+	esac
+}
+
+run() {
+	while :; do
+		if [ "$(cfg enabled)" = 1 ]; then
+			load_config
+			refresh_info
+			poll_once
+			sleep "$_poll"
+		else
+			# Disabled: stay alive so enabling it needs no service restart.
+			sleep 10
+		fi
+	done
+}
+
+# The test message names the device and a fixed number; it never reveals a real
+# caller, and it goes through exactly the same code path as a live event.
+case "${1:-run}" in
+run)
+	run
+	;;
+test)
+	load_config
+	refresh_info
+	send_event test "+8613166773059" ringing incoming
+	;;
+*)
+	echo "usage: call-forward {run|test}" >&2
+	exit 2
+	;;
+esac

@@ -37,6 +37,9 @@ fi
 
 NEW="0.1.0.$NEXT-r22-m8"
 printf '%s\n' "$NEW" > "$VFILE"
+# Keep the two packaging copies in lockstep, otherwise build.sh re-seeds
+# build/VERSION from m8-pkg/VERSION and the MANIFEST reports a stale version.
+[ -f "$HERE/m8-pkg/VERSION" ] && printf '%s\n' "$NEW" > "$HERE/m8-pkg/VERSION"
 if [ -d "$PKG" ]; then
 	printf '%s\n' "$NEW" > "$PKG/VERSION"
 fi

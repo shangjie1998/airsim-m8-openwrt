@@ -139,6 +139,17 @@ func main() {
 	if e != nil {
 		log.Fatal(e)
 	}
+	// A dropped audio stream is the earliest sign of a remote hang-up: ask the agent
+	// for an immediate call-state read so the UI does not wait for the next poll.
+	audio.OnStreamFault = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, "POST", "http://127.0.0.1:8575/api/calls/refresh", nil)
+		if resp, e := d.client.Do(req); e == nil {
+			resp.Body.Close()
+		}
+	}
+	go keepLogsBounded(ctx)
 	d.gateway.SetEarlyMediaBackend(gateway.NewMU300EarlyMediaBackend(d.bridge.OpenEarlyMedia))
 	if *trial {
 		d.gateway.SetEarlyMediaBackend(gateway.NewMU300EarlyMediaTrialBackend(d.bridge.OpenEarlyMedia, filepath.Join(*data, "early-media-trial.json")))
@@ -317,6 +328,45 @@ func (d *daemon) refreshNumber(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, map[string]any{"ok": true, "phone_number": identity["phone_number"]})
 }
+
+// keepLogsBounded trims oversized log files. The device root is a single 4 GB
+// partition and the native modem stack writes /var/log/e5-android-log.txt
+// forever, so an unattended log must not be allowed to fill it.
+func keepLogsBounded(ctx context.Context) {
+	trim := func(path string, maxSize, keep int64) {
+		info, e := os.Stat(path)
+		if e != nil || info.Size() <= maxSize {
+			return
+		}
+		data, e := os.ReadFile(path)
+		if e != nil {
+			return
+		}
+		if int64(len(data)) > keep {
+			data = data[int64(len(data))-keep:]
+			if at := bytes.IndexByte(data, '\n'); at >= 0 {
+				data = data[at+1:]
+			}
+		}
+		_ = os.WriteFile(path, data, 0o644)
+	}
+	run := func() {
+		trim("/var/log/e5-android-log.txt", 2*1024*1024, 256*1024)
+		trim("/var/log/messages", 1024*1024, 256*1024)
+	}
+	run()
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
 func (d *daemon) agentGet(path string) map[string]any {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

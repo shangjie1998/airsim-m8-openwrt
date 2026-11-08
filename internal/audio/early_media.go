@@ -32,6 +32,11 @@ func (s *earlyCaptureStream) Close() error {
 	return nil
 }
 func (b *Bridge) openEarlyMedia(parent context.Context, start earlyCaptureStart) (io.ReadCloser, error) {
+	// M8 does not read the handset microphone at any point of a call, early media
+	// included, so this backend refuses to open a capture stream there.
+	if d, e := Discover(); e == nil && d.NeedsVoiceScene {
+		return nil, errors.New("early media capture disabled on this device")
+	}
 	if !b.busy.CompareAndSwap(false, true) {
 		return nil, errors.New("audio already owned")
 	}

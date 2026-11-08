@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -87,12 +88,17 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 	if !selfTest && !calling {
 		return errors.New("no cellular call for PCM session")
 	}
+	// M8 must not pick up the handset's own microphone during a call, so this
+	// gateway never opens an ALSA capture stream on that platform.
+	useCapture := !devices.NeedsVoiceScene
+	if !selfTest {
+		recordEvent("session start probe=%s playback=%s capture=%s mic=%s", devices.CallProbe, devices.Playback, devices.Capture, micState(useCapture))
+	}
 	card := strconv.Itoa(devices.Card)
 	if devices.NeedsVoiceScene {
-		// M8: two-stage scene bring-up. Only the playback route is armed before
-		// aplay opens; the capture switch is flipped once playback is running.
-		// Arming both up front makes the playback FE die with EIO about a second
-		// later, and both switches default to off, so both are always cleared.
+		// M8: only the playback route is armed here. The capture route is never
+		// opened on this platform, so the handset microphone stays out of the call.
+		// Both switches default to off and are cleared again on the way out.
 		if err = voiceSwitch(ctx, card, voicePlaybackCtl, true); err != nil {
 			return err
 		}
@@ -123,21 +129,28 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 			return err
 		}
 	}
-	// The vendor 5.4 DMA driver cannot safely resubmit the same descriptor after
-	// an xrun. Exit and close the stream instead of ALSA's PREPARE/START recovery.
-	capture := exec.CommandContext(ctx, "arecord", "--fatal-errors", "-q", "-D", devices.Capture, "-t", "raw",
+	// M8 runs the 6.18 kernel, where ALSA's own PREPARE/START recovery works; keep
+	// aplay/arecord alive across an xrun or a transient EIO instead of tearing the
+	// whole session down on the first error. (The old --fatal-errors flag was a
+	// 5.4 vendor-DMA constraint that no longer applies here.)
+	capture := exec.CommandContext(ctx, "arecord", "-q", "-D", devices.Capture, "-t", "raw",
 		"-f", "S16_LE", "-r", strconv.Itoa(devices.CaptureRate), "-c", strconv.Itoa(devices.CaptureChannels),
 		"--period-size="+strconv.Itoa(devices.CapturePeriod), "--buffer-size="+strconv.Itoa(devices.CaptureBuffer))
-	play := exec.CommandContext(ctx, "aplay", "--fatal-errors", "-q", "-D", devices.Playback, "-t", "raw",
+	play := exec.CommandContext(ctx, "aplay", "-q", "-D", devices.Playback, "-t", "raw",
 		"-f", "S16_LE", "-r", strconv.Itoa(devices.PlaybackRate), "-c", strconv.Itoa(devices.PlaybackChannels),
 		"--period-size="+strconv.Itoa(devices.PlaybackPeriod), "--buffer-size="+strconv.Itoa(devices.PlaybackBuffer))
 	captureLog := &bytes.Buffer{}
 	playLog := &bytes.Buffer{}
 	capture.Stderr = captureLog
 	play.Stderr = playLog
-	captured, err := capture.StdoutPipe()
-	if err != nil {
-		return err
+	// Uplink keeps emitting silent 20 ms frames when capture is off, so the
+	// client still sees a steady stream.
+	var captured io.ReadCloser
+	if useCapture {
+		captured, err = capture.StdoutPipe()
+		if err != nil {
+			return err
+		}
 	}
 	played, err := play.StdinPipe()
 	if err != nil {
@@ -151,21 +164,20 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 	}
 	defer func() { cancel(); played.Close(); _ = play.Wait() }()
 	if devices.NeedsVoiceScene {
-		// Playback is up: arm the capture route, give the DSP time to settle,
-		// then open the capture stream.
-		if err = voiceSwitch(ctx, card, voiceCaptureCtl, true); err != nil {
-			return err
-		}
+		// M8 never arms the capture route: doing so hands the DSP voice capture FE
+		// to us and pulls the handset microphone into the call.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(1500 * time.Millisecond):
+		case <-time.After(300 * time.Millisecond):
 		}
 	}
-	if err = capture.Start(); err != nil {
-		return err
+	if useCapture {
+		if err = capture.Start(); err != nil {
+			return err
+		}
+		defer func() { cancel(); _ = capture.Wait() }()
 	}
-	defer func() { cancel(); _ = capture.Wait() }()
 	// A disconnected socket unblocks all reader/writer goroutines before return.
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(15 * time.Second))
@@ -191,44 +203,68 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 			}
 		}
 	}()
-	go func() {
-		// M8's voice capture FE already streams 8 kHz mono 16-bit, which is the
-		// native AirSIM frame rate: one 20 ms frame is exactly FrameBytes.
-		direct := devices.CaptureRate == 8000 && devices.CaptureChannels == 1
-		d := NewDownsampler()
-		period := devices.CapturePeriod * devices.CaptureChannels * 2
-		raw := make([]byte, period)
-		for {
-			if _, e := io.ReadFull(captured, raw); e != nil {
-				// EOF from the ALSA process is a hardware-stream failure, unlike
-				// a client socket closing normally. Preserve it in status.
-				if ctx.Err() != nil {
-					failures <- ctx.Err()
-				} else {
-					failures <- fmt.Errorf("ALSA capture stream ended: %s", strings.TrimSpace(captureLog.String()))
+	if useCapture {
+		go func() {
+			// M8's voice capture FE already streams 8 kHz mono 16-bit, which is the
+			// native AirSIM frame rate: one 20 ms frame is exactly FrameBytes.
+			direct := devices.CaptureRate == 8000 && devices.CaptureChannels == 1
+			d := NewDownsampler()
+			period := devices.CapturePeriod * devices.CaptureChannels * 2
+			raw := make([]byte, period)
+			for {
+				if _, e := io.ReadFull(captured, raw); e != nil {
+					// EOF from the ALSA process is a hardware-stream failure, unlike
+					// a client socket closing normally. Preserve it in status.
+					if ctx.Err() != nil {
+						failures <- ctx.Err()
+					} else {
+						failures <- fmt.Errorf("ALSA capture stream ended: %s", strings.TrimSpace(captureLog.String()))
+					}
+					return
 				}
-				return
+				if direct {
+					for off := 0; off+FrameBytes <= len(raw); off += FrameBytes {
+						c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+						if e := writeFull(c, raw[off:off+FrameBytes]); e != nil {
+							failures <- e
+							return
+						}
+						b.TX.Add(1)
+					}
+					continue
+				}
+				frame := d.Convert(raw)
+				c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if e := writeFull(c, frame); e != nil {
+					failures <- e
+					return
+				}
+				b.TX.Add(1)
 			}
-			if direct {
-				for off := 0; off+FrameBytes <= len(raw); off += FrameBytes {
+		}()
+	} else {
+		// Silent uplink: keep the cadence the client expects so a call without a
+		// handset microphone still looks like a healthy uplink stream.
+		go func() {
+			t := time.NewTicker(20 * time.Millisecond)
+			defer t.Stop()
+			silent := make([]byte, FrameBytes)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
 					c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-					if e := writeFull(c, raw[off:off+FrameBytes]); e != nil {
+					if e := writeFull(c, silent); e != nil {
 						failures <- e
 						return
 					}
 					b.TX.Add(1)
+					b.Silence.Add(1)
 				}
-				continue
 			}
-			frame := d.Convert(raw)
-			c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			if e := writeFull(c, frame); e != nil {
-				failures <- e
-				return
-			}
-			b.TX.Add(1)
-		}
-	}()
+		}()
+	}
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	u := &Upsampler{}
@@ -269,18 +305,144 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 	}()
 	watch := time.NewTicker(time.Second)
 	defer watch.Stop()
+	probes, gone := 0, 0
+	// A hung-up call is not an audio fault. When the remote party hangs up the DSP
+	// drops the voice path, and aplay/arecord then fail with EIO/EPIPE. Separate
+	// that from a real mid-call stream failure so the log stays honest.
+	callEnded := func() bool {
+		if selfTest {
+			return false
+		}
+		alive, e := probeCall(ctx, devices)
+		if e != nil {
+			return false
+		}
+		return !alive
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case e := <-failures:
+			if isStreamFault(e) {
+				// The remote hang-up kills the ALSA stream a few seconds before the
+				// modem reports the call gone, so one probe right here fires too early.
+				// Give the call state a grace period to settle; only a stream fault that
+				// outlives it counts as a real mid-call failure. 15s covers the modem's
+				// own reporting lag after the remote party hangs up.
+				if !selfTest {
+					recordEvent("stream fault: %v", e)
+					// A dropped audio stream is usually the first sign that the remote
+					// party hung up, well before the periodic call-state poll sees it.
+					if OnStreamFault != nil {
+						OnStreamFault()
+					}
+				}
+				grace := time.NewTimer(15 * time.Second)
+				tick := time.NewTicker(time.Second)
+				for {
+					select {
+					case <-ctx.Done():
+						grace.Stop()
+						tick.Stop()
+						return e
+					case <-grace.C:
+						tick.Stop()
+						if !selfTest {
+							recordEvent("stream fault outlived the grace period: real mid-call failure")
+						}
+						return e
+					case <-tick.C:
+						if callEnded() {
+							grace.Stop()
+							tick.Stop()
+							if !selfTest {
+								recordEvent("stream fault resolved as a hang-up, unwinding clean")
+							}
+							return nil
+						}
+					}
+				}
+			}
 			return e
 		case <-watch.C:
 			if time.Since(time.Unix(0, lastWrite.Load())) > 3*time.Second {
 				return errors.New("ALSA playback stalled")
 			}
+			probes++
+			// Two consecutive negatives, three seconds apart, before unwinding, so a
+			// single stale modem reading cannot cut a live call short.
+			if !selfTest && probes%3 == 0 {
+				if callEnded() {
+					gone++
+					if gone >= 2 {
+						recordEvent("call ended, unwinding clean")
+						return nil
+					}
+				} else {
+					gone = 0
+				}
+			}
 		}
 	}
+}
+
+// OnStreamFault, when set, is invoked the moment the audio stream dies. The daemon
+// uses it to ask the agent for an immediate call-state read instead of waiting for
+// the next poll.
+var OnStreamFault func()
+
+// micState renders the uplink capture mode for the session timeline.
+func micState(capture bool) string {
+	if capture {
+		return "on"
+	}
+	return "off"
+}
+
+// recordEvent appends a one-line audio timeline entry so a hang-up and a real
+// mid-call stream fault can be told apart afterwards without a live probe.
+// Best effort only: logging must never disturb the call.
+func recordEvent(format string, args ...any) {
+	const dir = "/opt/airsim-m8/data"
+	line := time.Now().Format(time.RFC3339) + " " + fmt.Sprintf(format, args...) + "\n"
+	if e := os.MkdirAll(dir, 0o755); e != nil {
+		return
+	}
+	path := dir + "/audio-events.log"
+	// The device root is a single 4 GB partition, so this timeline is capped:
+	// once it reaches 512 KB only the newest half is kept, in place.
+	if info, statErr := os.Stat(path); statErr == nil && info.Size() > 512*1024 {
+		if data, readErr := os.ReadFile(path); readErr == nil {
+			keep := data
+			if len(keep) > 256*1024 {
+				keep = keep[len(keep)-256*1024:]
+				if at := bytes.IndexByte(keep, '\n'); at >= 0 {
+					keep = keep[at+1:]
+				}
+			}
+			_ = os.WriteFile(path, keep, 0o644)
+		}
+	}
+	f, e := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if e != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(line)
+}
+
+// isStreamFault reports whether an error came from an ALSA stream dying rather
+// than from the client socket closing.
+func isStreamFault(e error) bool {
+	if e == nil {
+		return false
+	}
+	s := e.Error()
+	return strings.Contains(s, "ALSA capture stream ended") ||
+		strings.Contains(s, "ALSA playback stream ended") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "aplay:")
 }
 
 // SelfTest exercises the real DSP streams without placing or answering a call.

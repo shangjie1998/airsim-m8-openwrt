@@ -9,8 +9,8 @@ UMS9620 安卓手机，让 iPhone 在同一局域网里用这台手机的 SIM �
 |---|---|
 | 本适配仓库 | <https://github.com/shangjie1998/airsim-m8-openwrt> |
 | 上游项目 | <https://github.com/kai-wu-cortex/airsim-mu300> |
-| 已验收版本 | **`0.1.0.1-r22-m8`** |
-| 安装包 | [Release `v0.1.0.1-r22-m8`](https://github.com/shangjie1998/airsim-m8-openwrt/releases/tag/v0.1.0.1-r22-m8) · 5.7 MB（仓库内另有 [`dist/`](dist/) 同款） |
+| 已验收版本 | **`0.1.0.24-r22-m8`** |
+| 安装包 | [Release `v0.1.0.24-r22-m8`](https://github.com/shangjie1998/airsim-m8-openwrt/releases/tag/v0.1.0.24-r22-m8) · 5.7 MB（仓库内另有 [`dist/`](dist/) 同款） |
 | 使用者手册 | [README-M8.md](README-M8.md) —— 机型全景、逐功能调用说明、换机型核对表 |
 | 编译与微调 | [docs/M8_BUILD_AND_ADAPT.md](docs/M8_BUILD_AND_ADAPT.md) —— 工具链、编译坑、改功能后的流程 |
 | 上游原说明 | [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) —— U30 Air / F50 的 R22 原文，保留备查 |
@@ -47,6 +47,7 @@ UMS9620 安卓手机，让 iPhone 在同一局域网里用这台手机的 SIM �
 | 4 | 发送短信写入 **发件池 + 时间戳**，同步器与 LuCI 列表识别 `dir: mo` | `build/mu300-sms`、`sms-pool-sync.py`、`sms-dash.py` |
 | 5 | 挂断/接听的完整性校验改成"刷新即通过"，不再被 grace 缓存卡死 | `patches/AirSIM-m8-sms-callfix.patch` |
 | 6 | LuCI 复用**上游原生页面**（`airsim` / `airsim-sms` 两个 ubus 对象 + 菜单 + ACL），未自建页面 | `m8-pkg/luci/` |
+| 7 | **来电通知**：网页三事件开关（振铃 / 接听 / 挂断 / 未接），渠道继承短信转发，30 条投递历史；**仅支持单卡** | `m8-pkg/call-forward`、`luci/usr/libexec/rpcd/airsim-call`、`call.js` |
 
 每处"调用系统哪里"（哪个 ALSA 设备、哪个 mmcli 命令、哪个 rpcd 对象、哪个 procd 实例）在
 [README-M8.md 第 3 节](README-M8.md#3-每个功能调用了系统的哪里) 逐条写死。
@@ -58,13 +59,13 @@ UMS9620 安卓手机，让 iPhone 在同一局域网里用这台手机的 SIM �
 
 ```sh
 # 主机侧：从 Release 下载，再传到设备（版本号第四段是本地改动序号，不带括号）
-curl -LO "https://github.com/shangjie1998/airsim-m8-openwrt/releases/download/v0.1.0.1-r22-m8/airsim-m8-0.1.0.1-r22-m8.tar.gz"
-scp airsim-m8-0.1.0.1-r22-m8.tar.gz root@192.168.9.1:/tmp/
+curl -LO "https://github.com/shangjie1998/airsim-m8-openwrt/releases/download/v0.1.0.24-r22-m8/airsim-m8-0.1.0.24-r22-m8.tar.gz"
+scp airsim-m8-0.1.0.24-r22-m8.tar.gz root@192.168.9.1:/tmp/
 
 # 设备侧：解包安装（设备侧直接写系统路径会失败，必须先落 /tmp）
 ssh root@192.168.9.1
 mkdir -p /tmp/m8pkg && cd /tmp/m8pkg
-tar xzf /tmp/airsim-m8-0.1.0.1-r22-m8.tar.gz -C /tmp/m8pkg
+tar xzf /tmp/airsim-m8-0.1.0.24-r22-m8.tar.gz -C /tmp/m8pkg
 sh install.sh
 ```
 
@@ -84,6 +85,7 @@ sh /opt/airsim-m8/uninstall.sh
 
 | 现象 | 说明 |
 |---|---|
+| **双卡来电分不出是哪张卡** | 设备版 Agent 的 `callRecord` 没有卡槽字段，当前只插一张卡（联通 `46001`）实测；上游 PR 版已按 `MU300_SIM_SLOT` 逐卡查询，设备版待做 |
 | 通话约 50 秒后断链 | `aplay` 报 `pcm_write I/O error`，上下行帧计数冻结，DSP 开关自动回落；未解 |
 | 屏幕接听来电采不到下行 | 原生拨号器接听态独占采集路由（`arecord` 直接 I/O error）；改用 iOS 端接听即可 |
 | 偶尔闪白屏 | 面板 ESD 看门狗循环复位（`esd check failed` + `esd recovery end`），内核侧无软件开关，与安装包无关 |

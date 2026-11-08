@@ -22,6 +22,11 @@ git -C "$TASK_SOURCE" apply "$HERE/patches/AirSIM-e164.patch"
 # DTMF, and return a send timestamp with the SMS reply.
 git -C "$TASK_SOURCE" apply --check "$HERE/patches/AirSIM-m8-sms-callfix.patch"
 git -C "$TASK_SOURCE" apply "$HERE/patches/AirSIM-m8-sms-callfix.patch"
+# Fourth, independent patch: poll the call state once a second while a call is up.
+# No event-driven URC is active on this build, so a hang-up is otherwise only seen
+# by the next poll and the end-of-call state lags by a couple of seconds.
+git -C "$TASK_SOURCE" apply --check "$HERE/patches/AirSIM-m8-fast-hangup.patch"
+git -C "$TASK_SOURCE" apply "$HERE/patches/AirSIM-m8-fast-hangup.patch"
 # The upstream .gitattributes marks the Agent go.mod/go.sum export-ignore, so
 # `git archive` leaves them out and a module-mode build cannot resolve deps.
 git -C "$UPSTREAM" show "$BASE:module/module-agent/go.mod" > "$TASK_SOURCE/module/module-agent/go.mod"

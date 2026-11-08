@@ -1,0 +1,228 @@
+--- a/module/module-agent/main.go
++++ b/module/module-agent/main.go
+@@ -539,7 +539,9 @@
+ 
+ func callPollInterval(eventDriven, callActive bool) time.Duration {
+ 	if callActive {
+-		return 2 * time.Second
++		// No event-driven URC on this build, so a hang-up is only noticed by the
++		// next poll. One second keeps the end-of-call lag short.
++		return time.Second
+ 	}
+ 	if eventDriven {
+ 		return 30 * time.Second
+--- a/module/module-agent/calls.go
++++ b/module/module-agent/calls.go
+@@ -487,7 +487,19 @@
+ 		return "active"
+ 	default:
+ 		return ""
++	}
++}
++
++// callRefreshNow lets the local bridge ask for an immediate call-state read the
++// moment the audio stream drops: on this platform that is the first visible sign
++// of a remote hang-up, well before the periodic poll would notice it.
++func (a *agent) callRefreshNow(response http.ResponseWriter, request *http.Request) {
++	if request.Method != http.MethodPost {
++		response.WriteHeader(http.StatusMethodNotAllowed)
++		return
+ 	}
++	a.requestCallRefresh()
++	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
+ }
+ 
+ func (a *agent) callStatus(response http.ResponseWriter, request *http.Request) {
+--- a/module/module-agent/main.go
++++ b/module/module-agent/main.go
+@@ -331,6 +331,7 @@
+ 	mux.HandleFunc("/api/push/status", a.pushStatus)
+ 	mux.HandleFunc("/api/push/mode", a.pushMode)
+ 	mux.HandleFunc("/api/calls/status", a.callStatus)
++	mux.HandleFunc("/api/calls/refresh", a.callRefreshNow)
+ 	mux.HandleFunc("/api/calls/resolve", a.mu300ResolvePushedCall)
+ 	mux.HandleFunc("/api/calls/early-media", a.mu300EarlyMediaStatus)
+ 	mux.HandleFunc("/api/calls/cloud-early-media", a.mu300CloudEarlyMediaStatus)
+--- a/module/module-agent/push.go
++++ b/module/module-agent/push.go
+@@ -8,6 +8,7 @@
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"log"
+ 	"net"
+ 	"net/http"
+ 	"net/url"
+@@ -682,7 +683,7 @@
+ 	if !cloudEnabled || registration.RelayURL == "" || callUUID == "" {
+ 		return nil
+ 	}
+-	return p.postJSON(client, registration.RelayURL+"/v2/events/call-state", callStatePushEvent{
++	e := p.postJSON(client, registration.RelayURL+"/v2/events/call-state", callStatePushEvent{
+ 		AgentID: registration.AndroidAgentID,
+ 		Event:   "call_state", DeviceID: registration.DeviceID,
+ 		DeviceSecret: registration.DeviceSecret, CallID: callID,
+@@ -690,6 +691,14 @@
+ 		Source: "agent", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+ 		TraceID: fmt.Sprintf("agent-%s-%d-%s", callID, generation, phase),
+ 	})
++	// Visibility for the hang-up path: whether the relay accepted the end-of-call
++	// event decides if iOS can ever close the CallKit call on its own.
++	if e != nil {
++		log.Printf("push call-state %s phase=%s FAILED: %v", callID, phase, e)
++	} else {
++		log.Printf("push call-state %s phase=%s delivered", callID, phase)
++	}
++	return e
+ }
+ 
+ func validCallLifecyclePhase(phase string) bool {
+--- a/module/module-agent/push.go
++++ b/module/module-agent/push.go
+@@ -4,6 +4,7 @@
+ 	"bytes"
+ 	"context"
+ 	"crypto/rand"
++	"crypto/tls"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"errors"
+@@ -217,9 +218,18 @@
+ 	}
+ 	// 蜂窝链路实测 RTT 会短时达到 1.4 秒并伴随丢包。心跳复用 keep-alive 后
+ 	// 不会每 30 秒重新握手；首次连接则给 DNS/TCP/TLS 足够恢复窗口。
++	// Keep the relay on HTTP/1.1. Over a flaky cellular/ethernet path an idle
++	// HTTP/2 connection can die silently and then swallow a request until
++	// ResponseHeaderTimeout fires ("http2: timeout awaiting response headers"),
++	// which is how the end-of-call event never reached the relay. HTTP/1.1 fails
++	// fast on a stale connection and Go retries the request on a fresh one.
++	transport.ForceAttemptHTTP2 = false
++	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+ 	transport.TLSHandshakeTimeout = 15 * time.Second
+-	transport.ResponseHeaderTimeout = 15 * time.Second
+-	transport.IdleConnTimeout = 90 * time.Second
++	transport.ResponseHeaderTimeout = 10 * time.Second
++	// Shorter idle life: a connection parked longer than this is more likely to
++	// be dead on the far side than worth reusing.
++	transport.IdleConnTimeout = 20 * time.Second
+ 	return &http.Client{Timeout: 30 * time.Second, Transport: transport}
+ }
+ 
+--- a/module/module-agent/push.go
++++ b/module/module-agent/push.go
+@@ -225,8 +225,8 @@
+ 	// fast on a stale connection and Go retries the request on a fresh one.
+ 	transport.ForceAttemptHTTP2 = false
+ 	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+-	transport.TLSHandshakeTimeout = 15 * time.Second
+-	transport.ResponseHeaderTimeout = 10 * time.Second
++	transport.TLSHandshakeTimeout = 20 * time.Second
++	transport.ResponseHeaderTimeout = 20 * time.Second
+ 	// Shorter idle life: a connection parked longer than this is more likely to
+ 	// be dead on the far side than worth reusing.
+ 	transport.IdleConnTimeout = 20 * time.Second
+@@ -693,14 +693,25 @@
+ 	if !cloudEnabled || registration.RelayURL == "" || callUUID == "" {
+ 		return nil
+ 	}
+-	e := p.postJSON(client, registration.RelayURL+"/v2/events/call-state", callStatePushEvent{
++	payload := callStatePushEvent{
+ 		AgentID: registration.AndroidAgentID,
+ 		Event:   "call_state", DeviceID: registration.DeviceID,
+ 		DeviceSecret: registration.DeviceSecret, CallID: callID,
+ 		CallUUID: callUUID, Generation: generation, Phase: phase,
+ 		Source: "agent", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+ 		TraceID: fmt.Sprintf("agent-%s-%d-%s", callID, generation, phase),
+-	})
++	}
++	e := p.postJSON(client, registration.RelayURL+"/v2/events/call-state", payload)
++	// The path to the relay is lossy (measured ~66% ICMP loss, 300-400ms RTT), so a
++	// single attempt regularly dies in the TLS handshake or while awaiting response
++	// headers. This event is idempotent (trace_id + generation), and dropping the
++	// "ended" event is exactly what leaves iOS stuck showing a live call, so retry
++	// on a fresh connection instead of giving up.
++	for attempt := 1; e != nil && attempt <= 2; attempt++ {
++		client.CloseIdleConnections()
++		time.Sleep(time.Duration(attempt) * time.Second)
++		e = p.postJSON(client, registration.RelayURL+"/v2/events/call-state", payload)
++	}
+ 	// Visibility for the hang-up path: whether the relay accepted the end-of-call
+ 	// event decides if iOS can ever close the CallKit call on its own.
+ 	if e != nil {
+--- a/module/module-agent/push.go
++++ b/module/module-agent/push.go
+@@ -225,6 +225,10 @@
+ 	// fast on a stale connection and Go retries the request on a fresh one.
+ 	transport.ForceAttemptHTTP2 = false
+ 	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
++	// Clearing TLSNextProto alone is not enough: the TLS handshake still advertises
++	// "h2", so Cloudflare picks HTTP/2 while the client parses the reply as
++	// HTTP/1.1 ("malformed HTTP response \x00\x00\x12\x04"). Pin ALPN to http/1.1.
++	transport.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+ 	transport.TLSHandshakeTimeout = 20 * time.Second
+ 	transport.ResponseHeaderTimeout = 20 * time.Second
+ 	// Shorter idle life: a connection parked longer than this is more likely to
+@@ -749,7 +753,7 @@
+ 		legacy := registration.AndroidPhoneNumber
+ 		number = &legacy
+ 	}
+-	return p.postJSON(client, registration.RelayURL+"/v1/events/heartbeat", agentHeartbeatEvent{
++	event := agentHeartbeatEvent{
+ 		CommandRoutingVersion: 1,
+ 		Event:                 "agent_heartbeat", DeviceID: registration.DeviceID,
+ 		DeviceSecret: registration.DeviceSecret, AgentVersion: agentVersion,
+@@ -760,7 +764,17 @@
+ 		CellularRegistration: snapshot.CellularRegistration,
+ 		CellularRecovery:     snapshot.CellularRecovery, ECMCarrier: snapshot.ECMCarrier,
+ 		SignalDBM: snapshot.SignalDBM, Battery: snapshot.Battery,
+-	})
++	}
++	e := p.postJSON(client, registration.RelayURL+"/v1/events/heartbeat", event)
++	for attempt := 1; e != nil && attempt <= 2; attempt++ {
++		client.CloseIdleConnections()
++		time.Sleep(time.Duration(attempt) * time.Second)
++		e = p.postJSON(client, registration.RelayURL+"/v1/events/heartbeat", event)
++	}
++	if e != nil {
++		log.Printf("push heartbeat FAILED: %v", e)
++	}
++	return e
+ }
+ 
+ func (p *pushManager) commandRegistration() (pushRegistration, bool) {
+--- a/module/module-agent/push.go
++++ b/module/module-agent/push.go
+@@ -4,7 +4,6 @@
+ 	"bytes"
+ 	"context"
+ 	"crypto/rand"
+-	"crypto/tls"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"errors"
+@@ -218,22 +217,9 @@
+ 	}
+ 	// 蜂窝链路实测 RTT 会短时达到 1.4 秒并伴随丢包。心跳复用 keep-alive 后
+ 	// 不会每 30 秒重新握手；首次连接则给 DNS/TCP/TLS 足够恢复窗口。
+-	// Keep the relay on HTTP/1.1. Over a flaky cellular/ethernet path an idle
+-	// HTTP/2 connection can die silently and then swallow a request until
+-	// ResponseHeaderTimeout fires ("http2: timeout awaiting response headers"),
+-	// which is how the end-of-call event never reached the relay. HTTP/1.1 fails
+-	// fast on a stale connection and Go retries the request on a fresh one.
+-	transport.ForceAttemptHTTP2 = false
+-	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+-	// Clearing TLSNextProto alone is not enough: the TLS handshake still advertises
+-	// "h2", so Cloudflare picks HTTP/2 while the client parses the reply as
+-	// HTTP/1.1 ("malformed HTTP response \x00\x00\x12\x04"). Pin ALPN to http/1.1.
+-	transport.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+-	transport.TLSHandshakeTimeout = 20 * time.Second
+-	transport.ResponseHeaderTimeout = 20 * time.Second
+-	// Shorter idle life: a connection parked longer than this is more likely to
+-	// be dead on the far side than worth reusing.
+-	transport.IdleConnTimeout = 20 * time.Second
++	transport.TLSHandshakeTimeout = 15 * time.Second
++	transport.ResponseHeaderTimeout = 15 * time.Second
++	transport.IdleConnTimeout = 90 * time.Second
+ 	return &http.Client{Timeout: 30 * time.Second, Transport: transport}
+ }
+ 

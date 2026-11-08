@@ -1,0 +1,203 @@
+#!/bin/sh
+# rpcd object behind the "来电通知" page. Values are validated here and written
+# through uci; nothing from the request ever reaches a shell command.
+. /usr/share/libubox/jshn.sh
+
+SECTION=airsim-call-forward.forward
+HISTORY=/opt/airsim-m8/data/call-forward-history
+
+opt() { uci -q get "$SECTION.$1" 2>/dev/null; }
+sms_opt() { uci -q get "e5-notify.forward.$1" 2>/dev/null; }
+
+add_opt() { json_add_string "$1" "$(opt "$1")"; }
+
+history_json() {
+	json_add_array history
+	[ -f "$HISTORY" ] || { json_close_array; return; }
+	# newest last on disk; the page shows newest first
+	_tail=$(tail -n 30 "$HISTORY" 2>/dev/null | tac 2>/dev/null || tail -n 30 "$HISTORY" 2>/dev/null)
+	_old_ifs=$IFS
+	IFS='
+'
+	for _row in $_tail; do
+		[ -n "$_row" ] || continue
+		_ts=${_row%%|*}; _rest=${_row#*|}
+		_kind=${_rest%%|*}; _rest=${_rest#*|}
+		_result=${_rest%%|*}; _code=${_rest#*|}
+		json_add_object
+		json_add_string kind "$_kind"
+		json_add_string result "$_result"
+		json_add_string http_code "$_code"
+		json_add_string time "$_ts"
+		json_close_object
+	done
+	IFS=$_old_ifs
+	json_close_array
+}
+
+status_json() {
+	json_add_object status
+	json_add_string enabled "$(opt enabled)"
+	_last=$(tail -n 1 "$HISTORY" 2>/dev/null)
+	if [ -n "$_last" ]; then
+		json_add_string last_result "$(printf '%s' "$_last" | cut -d'|' -f3)"
+		json_add_string last_code "$(printf '%s' "$_last" | cut -d'|' -f4)"
+	else
+		json_add_string last_result idle
+		json_add_string last_code ''
+	fi
+	if [ -n "$(opt url)" ]; then
+		json_add_string channel own
+	else
+		json_add_string channel sms
+	fi
+	json_add_string sms_url "$(sms_opt webhook_url)"
+	json_add_string sms_enabled "$(sms_opt enabled)"
+	json_add_boolean service_running "$(pgrep -f 'airsim-m8/call-forward' >/dev/null 2>&1 && echo true || echo false)"
+	history_json
+	json_close_object
+}
+
+get_view() {
+	json_init
+	json_add_object config
+	add_opt enabled
+	add_opt url
+	add_opt method
+	add_opt content_type
+	add_opt timeout
+	add_opt body
+	add_opt expect
+	add_opt headers
+	add_opt notify_ringing
+	add_opt notify_answered
+	add_opt notify_ended
+	add_opt notify_missed
+	add_opt poll
+	json_close_object
+	status_json
+	json_add_string mode shared
+	json_dump
+}
+
+status_view() {
+	json_init
+	status_json
+	json_dump
+}
+
+flag() {
+	case "$1" in 0|1) printf '%s' "$1" ;; *) printf '' ;; esac
+}
+
+save() {
+	IFS= read -r request
+	if ! json_load "$request"; then
+		printf '%s\n' '{"error":"无效设置请求"}'
+		exit 0
+	fi
+	json_get_var config config
+	json_init
+	json_load "$config" || { printf '%s\n' '{"error":"无效设置"}'; exit 0; }
+
+	json_get_var enabled enabled
+	json_get_var url url
+	json_get_var method method
+	json_get_var content_type content_type
+	json_get_var timeout timeout
+	json_get_var body body
+	json_get_var expect expect
+	json_get_var headers headers
+	json_get_var notify_ringing notify_ringing
+	json_get_var notify_answered notify_answered
+	json_get_var notify_ended notify_ended
+	json_get_var notify_missed notify_missed
+
+	case "$(flag "$enabled")" in 0|1) ;; *) printf '%s\n' '{"error":"总开关取值无效"}'; exit 0 ;; esac
+	for pair in ringing:"$notify_ringing" answered:"$notify_answered" ended:"$notify_ended" missed:"$notify_missed"; do
+		n=${pair%%:*}; v=${pair#*:}
+		case "$(flag "$v")" in 0|1) ;; *) printf '%s\n' "{\"error\":\"通知项 $n 取值无效\"}"; exit 0 ;; esac
+	done
+
+	case "$url" in
+	'') ;;
+	https://*) ;;
+	http://*) ;;
+	*) printf '%s\n' '{"error":"推送地址必须以 http:// 或 https:// 开头"}'; exit 0 ;;
+	esac
+	[ ${#url} -le 512 ] || { printf '%s\n' '{"error":"推送地址过长"}'; exit 0; }
+
+	case "$method" in POST|GET) ;; *) printf '%s\n' '{"error":"请求方法只支持 POST 或 GET"}'; exit 0 ;; esac
+	case "$content_type" in
+	application/json|application/x-www-form-urlencoded|text/plain) ;;
+	*) printf '%s\n' '{"error":"正文格式无效"}'; exit 0 ;;
+	esac
+	case "$timeout" in
+	'') timeout=12 ;;
+	*) [ "$timeout" -ge 1 ] 2>/dev/null && [ "$timeout" -le 120 ] 2>/dev/null ||
+		{ printf '%s\n' '{"error":"请求超时必须为 1–120 秒"}'; exit 0; } ;;
+	esac
+
+	uci -q set "$SECTION.enabled=$enabled"
+	uci -q set "$SECTION.url=$url"
+	uci -q set "$SECTION.method=$method"
+	uci -q set "$SECTION.content_type=$content_type"
+	uci -q set "$SECTION.timeout=$timeout"
+	uci -q set "$SECTION.notify_ringing=$notify_ringing"
+	uci -q set "$SECTION.notify_answered=$notify_answered"
+	uci -q set "$SECTION.notify_ended=$notify_ended"
+	uci -q set "$SECTION.notify_missed=$notify_missed"
+	uci -q set "$SECTION.expect=$expect"
+	if [ -n "$body" ]; then
+		uci -q set "$SECTION.body=$body"
+	else
+		uci -q delete "$SECTION.body"
+	fi
+	if [ -n "$headers" ]; then
+		uci -q set "$SECTION.headers=$headers"
+	else
+		uci -q delete "$SECTION.headers"
+	fi
+
+	uci -q commit airsim-call-forward || { printf '%s\n' '{"error":"设备保存失败"}'; exit 0; }
+	printf '%s\n' '{"ok":1}'
+}
+
+test_send() {
+	/usr/libexec/airsim-m8/call-forward test >/dev/null 2>&1
+	sleep 1
+	json_init
+	_last=$(tail -n 1 "$HISTORY" 2>/dev/null)
+	if [ -n "$_last" ] && [ "$(printf '%s' "$_last" | cut -d'|' -f2)" = test ]; then
+		_result=$(printf '%s' "$_last" | cut -d'|' -f3)
+		_code=$(printf '%s' "$_last" | cut -d'|' -f4)
+		[ "$_result" = sent ] && json_add_boolean ok 1 || json_add_boolean ok 0
+		json_add_string result "$_result"
+		json_add_string http_code "$_code"
+	else
+		json_add_boolean ok 0
+		json_add_string result service_answer_missing
+		json_add_string http_code ''
+	fi
+	json_dump
+}
+
+clear_history() {
+	: > "$HISTORY" 2>/dev/null || { printf '%s\n' '{"error":"清空失败"}'; exit 0; }
+	printf '%s\n' '{"ok":1}'
+}
+
+case "$1" in
+list)
+	printf '%s\n' '{"call_get":{},"call_status":{},"call_save":{"config":""},"call_test":{},"call_clear":{}}'
+	;;
+call)
+	case "$2" in
+	call_get) get_view ;;
+	call_status) status_view ;;
+	call_save) save ;;
+	call_test) test_send ;;
+	call_clear) clear_history ;;
+	esac
+	;;
+esac

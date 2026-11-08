@@ -9,7 +9,7 @@
 
 - 上游项目：[kai-wu-cortex/airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)
 - 本适配仓库：<https://github.com/shangjie1998/airsim-m8-openwrt>
-- 当前已验收版本：**`0.1.0.1-r22-m8`**（详见 [版本口径](#版本口径)）
+- 当前已验收版本：**`0.1.0.24-r22-m8`**（详见 [版本口径](#版本口径)）
 
 > 感谢上游作者 **kai-wu-cortex** 开源 [airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)。
 > 本仓库的 daemon、Agent、LuCI 页面、AirSIM 协议实现全部来自上游；这里做的是"让同一套东西在
@@ -72,6 +72,12 @@ OpenWrt 版本号与上游主线对应，主线仓库：<https://github.com/open
 | `/usr/libexec/rpcd/airsim`、`/usr/libexec/rpcd/airsim-sms` | LuCI 的两个 ubus 后端 |
 | `/usr/share/luci/menu.d/luci-app-airsim.json`、`/usr/share/rpcd/acl.d/luci-app-airsim.json` | 菜单与 ACL |
 | `/www/luci-static/resources/view/airsim/{overview,manage,sms}.js`、`overview.css` | 上游原生页面 |
+| `/usr/libexec/airsim-m8/call-forward` | 来电通知轮询脚本（`AT+CLCC` → 状态机 → webhook） |
+| `/etc/init.d/airsim-call-forward` | procd 服务（START=97）；功能关闭时也常驻，开关不用重启 |
+| `/usr/libexec/rpcd/airsim-call` | 来电通知的 ubus 后端（`call_get` / `call_status` / `call_save` / `call_test` / `call_clear`） |
+| `/www/luci-static/resources/view/airsim/call.js` | 来电通知页面，版式与字段照原生短信转发页复制 |
+| `/etc/config/airsim-call-forward` | uci 配置（段名**必须**是 `forward`，匿名段读不到） |
+| `/opt/airsim-m8/data/call-forward-history` | 投递历史 30 条，每行 `时间戳\|事件\|结果\|HTTP码` |
 | `/etc/config/airsim` | uci 配置 |
 
 **故意不改的东西**：`agent_kind=mu300`（iOS 靠它识别设备类型）、Go module 路径、二进制名、
@@ -203,6 +209,23 @@ scts: <SCTS 时间串>
 
 ---
 
+### 3.10 来电通知（网页）
+
+- 页面：LuCI → 服务 → AirSIM → **来电通知**，文件 `/www/luci-static/resources/view/airsim/call.js`；
+  卡片结构、字段名、历史表格都照上游原生短信转发页（`mud-card` / `mud-fwd-*`）复制，不自创版式
+- 后端：`/usr/libexec/rpcd/airsim-call` 提供 `call_get` / `call_status` / `call_save` / `call_test` / `call_clear`
+- 轮询：`/usr/libexec/airsim-m8/call-forward` 每 `poll` 秒（默认 2）用 `mu300-at` 读一次 `AT+CLCC`，
+  按 `dir` / `stat` 判状态：`dir=1` 来电、`stat 4/5` 振铃、`stat 0` 通话中
+- 事件：`ringing` → `answered` → `ended` / `missed`，按各自开关投递；结果写
+  `/opt/airsim-m8/data/call-forward-history`（30 条）
+- 配置：`uci airsim-call-forward.forward` —— `url`、`method`、`content_type`、`timeout`、`poll`、
+  `expect`、`notify_ringing`、`notify_answered`、`notify_ended`、`notify_missed`、`body`
+- 设备信息：本机号取 Agent `/api/status` 的 `phone_number`，运营商与信号取 `mmcli`，
+  开机时长读 `/proc/uptime`；整组缓存 5 分钟（`/tmp/call-forward.info`），**通话期间不碰 modem**
+- 正文占位符：`{number}` `{time}` `{tag}` `{self}` `{operator}` `{signal}` `{uptime}` `{device}`；
+  `{tag}` 展开为 `#CALL #CALL_IN` / `#CALL_ANSWER` / `#CALL_END` / `#CALL_MISSED`
+- 默认**关闭**（`enabled=0`）；页面开关即生效，不重启服务，也不影响短信转发
+
 ## 4. 直接安装
 
 前置条件（安装器会逐项检查，任一项不满足直接退出，不会装出个哑巴系统）：
@@ -215,12 +238,12 @@ scts: <SCTS 时间串>
 
 ```sh
 # 1. 把安装包传到设备 /tmp（scp 直写系统路径会失败，必须先落 /tmp）
-scp "airsim-m8-0.1.0.1-r22-m8.tar.gz" root@192.168.9.1:/tmp/
+scp "airsim-m8-0.1.0.24-r22-m8.tar.gz" root@192.168.9.1:/tmp/
 
 # 2. 设备侧解包安装
 ssh root@192.168.9.1
 mkdir -p /tmp/m8pkg && cd /tmp/m8pkg
-tar xzf "/tmp/airsim-m8-0.1.0.1-r22-m8.tar.gz" -C /tmp/m8pkg
+tar xzf "/tmp/airsim-m8-0.1.0.24-r22-m8.tar.gz" -C /tmp/m8pkg
 sh install.sh
 ```
 
@@ -283,6 +306,10 @@ daemon `/status.version` 与 Agent `version`（`0.4.7-mu300.<VERSION>`）同串�
 ---
 
 ## 8. 已知限制（都能复现，已记录，不是"偶发"）
+
+> **双卡未解决**：两张卡同时插时，设备版无法区分来电落在哪张卡（Agent 的 `callRecord` 无卡槽字段），
+> 通知里只能给号码和时间，给不出卡槽。当前只在单卡（联通 `46001`）上验证过。
+> 上游 PR 版已按 `MU300_SIM_SLOT` 逐卡查询 `AT+CLCC`，设备版待跟进。
 
 | 现象 | 原因 | 状态 |
 |---|---|---|
