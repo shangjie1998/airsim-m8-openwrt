@@ -268,7 +268,7 @@ EOF
 daemon `/status`（关键字段）：
 
 ```json
-{"audio_available":true,"product":"AirSIM for VIPME-M8","version":"0.1.0(1)-r22-m8",
+{"audio_available":true,"product":"AirSIM for VIPME-M8","version":"0.1.0.1-r22-m8",
  "devices":{"Card":0,"Capture":"hw:0,9","Playback":"hw:0,18",
             "CaptureRate":8000,"CaptureChannels":1,"CapturePeriod":640,"CaptureBuffer":1280,
             "PlaybackRate":16000,"PlaybackChannels":1,"PlaybackPeriod":320,"PlaybackBuffer":1920,
@@ -280,7 +280,7 @@ Agent `/api/health`：
 ```json
 {"ok":true,"phone_number":"+8613166773059","platform":"mu300-arm64-openwrt",
  "at_device":"mu300-atd","at_consecutive_failures":0,
- "version":"0.4.7-mu300.0.1.0(1)-r22-m8"}
+ "version":"0.4.7-mu300.0.1.0.1-r22-m8"}
 ```
 
 短信池条目（收到）：

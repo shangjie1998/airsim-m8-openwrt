@@ -9,7 +9,7 @@
 
 - 上游项目：[kai-wu-cortex/airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)
 - 本适配仓库：<https://github.com/shangjie1998/airsim-m8-openwrt>
-- 当前已验收版本：**`0.1.0(1)-r22-m8`**（详见 [版本口径](#版本口径)）
+- 当前已验收版本：**`0.1.0.1-r22-m8`**（详见 [版本口径](#版本口径)）
 
 > 感谢上游作者 **kai-wu-cortex** 开源 [airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)。
 > 本仓库的 daemon、Agent、LuCI 页面、AirSIM 协议实现全部来自上游；这里做的是"让同一套东西在
@@ -215,12 +215,12 @@ scts: <SCTS 时间串>
 
 ```sh
 # 1. 把安装包传到设备 /tmp（scp 直写系统路径会失败，必须先落 /tmp）
-scp "airsim-m8-0.1.0(1)-r22-m8.tar.gz" root@192.168.9.1:/tmp/
+scp "airsim-m8-0.1.0.1-r22-m8.tar.gz" root@192.168.9.1:/tmp/
 
 # 2. 设备侧解包安装
 ssh root@192.168.9.1
 mkdir -p /tmp/m8pkg && cd /tmp/m8pkg
-tar xzf "/tmp/airsim-m8-0.1.0(1)-r22-m8.tar.gz" -C /tmp/m8pkg
+tar xzf "/tmp/airsim-m8-0.1.0.1-r22-m8.tar.gz" -C /tmp/m8pkg
 sh install.sh
 ```
 
@@ -264,10 +264,13 @@ sh /opt/airsim-m8/uninstall.sh
 
 ## 7. 版本口径
 
-统一一个串：**`0.1.0(N)-r22-m8`**
+统一一个串：**`0.1.0.<N>-r22-m8`**
 
 - `0.1.0`、`r22`：上游版本，跟上游一致，不动
-- `(N)`：本地改动序号，**每打包发布一次 +1**，从 `(1)` 起
+- `<N>`：本地改动序号（版本第四段），**每打包发布一次 +1**，从 `1` 起
+  早期用过 `(N)` 括号写法，但 GitHub 会在上传 Release 附件时把文件名里的括号改成点
+  （`airsim-m8-0.1.0(2)-r22-m8.tar.gz` 变成 `airsim-m8-0.1.0.2.-r22-m8.tar.gz`，上传还会失败），
+  所以改成了纯点号：`0.1.0.1`、`0.1.0.2`……
 - `-m8`：设备名
 
 ```sh
