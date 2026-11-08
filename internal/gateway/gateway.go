@@ -299,10 +299,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/v1/health" {
 		w.Header().Set("Content-Type", "application/json")
-		capable, number, battery := g.agentIdentity(r.Context())
+		capable, number, battery, slots := g.agentIdentity(r.Context())
 		health := map[string]any{"ok": true, "version": 1, "transport": "vowlan", "agent_id": g.id, "identity_proof": Sign(key, "AIRSIM-HEALTH1\n"+nonce+"\n"+g.id), "canonical_call_ids": capable, "phone_number": number, "agent_kind": "mu300", "device_name": "AirSIM VIPME-M8", "manufacturer": "ZTE", "model": "VIPME-M8"}
 		if battery != nil {
 			health["battery"] = battery
+		}
+		// iOS 靠这份带 identity_proof 的设备信息决定用哪张卡；缺了 sim_slots
+		// 它就只能退化到单个号码，双卡列表直接消失。
+		if len(slots) > 0 {
+			health["sim_slots"] = slots
 		}
 		json.NewEncoder(w).Encode(health)
 		return
@@ -375,13 +380,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (g *Gateway) agentIdentity(parent context.Context) (bool, string, *batteryReading) {
+func (g *Gateway) agentIdentity(parent context.Context) (bool, string, *batteryReading, json.RawMessage) {
 	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", "http://127.0.0.1:8575/api/health", nil)
 	resp, err := g.client.Do(req)
 	if err != nil {
-		return false, "", nil
+		return false, "", nil, nil
 	}
 	defer resp.Body.Close()
 	var health struct {
@@ -390,11 +395,12 @@ func (g *Gateway) agentIdentity(parent context.Context) (bool, string, *batteryR
 		Canonical bool            `json:"canonical_call_ids"`
 		Profile   string          `json:"runtime_profile"`
 		Number    string          `json:"phone_number"`
+		SIMSlots  json.RawMessage `json:"sim_slots"`
 	}
 	if resp.StatusCode != 200 || json.NewDecoder(io.LimitReader(resp.Body, 32768)).Decode(&health) != nil || health.Profile != "mu300-openwrt" {
-		return false, "", nil
+		return false, "", nil, nil
 	}
-	return health.OK && health.Canonical, health.Number, validBattery(health.Battery, time.Now())
+	return health.OK && health.Canonical, health.Number, validBattery(health.Battery, time.Now()), health.SIMSlots
 }
 
 func signedDialReceipt(request, response []byte, nonce string, key []byte) ([]byte, error) {

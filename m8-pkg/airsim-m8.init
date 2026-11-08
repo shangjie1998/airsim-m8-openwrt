@@ -6,7 +6,11 @@ START=95
 STOP=10
 USE_PROCD=1
 
-AGENT_ENV="AIRSIM_RUNTIME_PROFILE=mu300-openwrt AIRSIM_VOICE_BACKEND=mu300 AIRSIM_MU300_MODE=cloud AIRSIM_MU300_PCM_ADDRESS=127.0.0.1:7580"
+# /var is a symlink to /tmp on this firmware, so the Agent's default state
+# directory (/var/lib/airsim) is memory-backed: the pairing and the cloud
+# heartbeat credentials would vanish on every reboot. Pin it to the real
+# partition instead.
+AGENT_ENV="AIRSIM_RUNTIME_PROFILE=mu300-openwrt AIRSIM_VOICE_BACKEND=mu300 AIRSIM_MU300_MODE=cloud AIRSIM_MU300_PCM_ADDRESS=127.0.0.1:7580 AIRSIM_DATA_DIR=/opt/airsim-m8/agent-data"
 
 start_service() {
 	procd_open_instance daemon

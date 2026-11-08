@@ -32,8 +32,22 @@ AVAIL=$(df -k /opt | awk 'NR==2 {print $4}')
 [ "${AVAIL:-0}" -gt 20000 ] || die "less than 20 MB free on /opt"
 
 say "== installing AirSIM bubble"
-mkdir -p /opt/airsim-m8/bin /opt/airsim-m8/data /etc/mu300/sms-pool/msg
-chmod 700 /opt/airsim-m8/data
+mkdir -p /opt/airsim-m8/bin /opt/airsim-m8/data /opt/airsim-m8/agent-data /etc/mu300/sms-pool/msg
+chmod 700 /opt/airsim-m8/data /opt/airsim-m8/agent-data
+# This firmware symlinks /var to /tmp, so the Agent's default data directory
+# (/var/lib/airsim) lives in RAM and the pairing plus the cloud heartbeat
+# credentials were wiped on every reboot. The service script now pins the Agent
+# to /opt/airsim-m8/agent-data; carry the old state over once so a working
+# pairing survives the upgrade.
+if [ -d /tmp/lib/airsim ]; then
+	for item in push.json push.json.last-good esim-notes.json; do
+		if [ -e "/tmp/lib/airsim/$item" ] && [ ! -e "/opt/airsim-m8/agent-data/$item" ]; then
+			cp -a "/tmp/lib/airsim/$item" "/opt/airsim-m8/agent-data/$item"
+			say "   migrated agent state: $item"
+		fi
+	done
+fi
+chmod 700 /opt/airsim-m8/agent-data
 if /etc/init.d/airsim-m8 status >/dev/null 2>&1; then
 	/etc/init.d/airsim-m8 stop || true
 fi
