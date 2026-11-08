@@ -9,8 +9,8 @@ UMS9620 安卓手机，让 iPhone 在同一局域网里用这台手机的 SIM �
 |---|---|
 | 本适配仓库 | <https://github.com/shangjie1998/airsim-m8-openwrt> |
 | 上游项目 | <https://github.com/kai-wu-cortex/airsim-mu300> |
-| 已验收版本 | **`0.1.0.24-r22-m8`** |
-| 安装包 | [Release `v0.1.0.24-r22-m8`](https://github.com/shangjie1998/airsim-m8-openwrt/releases/tag/v0.1.0.24-r22-m8) · 5.7 MB（仓库内另有 [`dist/`](dist/) 同款） |
+| 已验收版本 | **`0.1.0.25-r22-m8`** |
+| 安装包 | [Release `v0.1.0.25-r22-m8`](https://github.com/shangjie1998/airsim-m8-openwrt/releases/tag/v0.1.0.24-r22-m8) · 5.7 MB（仓库内另有 [`dist/`](dist/) 同款） |
 | 使用者手册 | [README-M8.md](README-M8.md) —— 机型全景、逐功能调用说明、换机型核对表 |
 | 编译与微调 | [docs/M8_BUILD_AND_ADAPT.md](docs/M8_BUILD_AND_ADAPT.md) —— 工具链、编译坑、改功能后的流程 |
 | 上游原说明 | [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) —— U30 Air / F50 的 R22 原文，保留备查 |
@@ -59,13 +59,13 @@ UMS9620 安卓手机，让 iPhone 在同一局域网里用这台手机的 SIM �
 
 ```sh
 # 主机侧：从 Release 下载，再传到设备（版本号第四段是本地改动序号，不带括号）
-curl -LO "https://github.com/shangjie1998/airsim-m8-openwrt/releases/download/v0.1.0.24-r22-m8/airsim-m8-0.1.0.24-r22-m8.tar.gz"
-scp airsim-m8-0.1.0.24-r22-m8.tar.gz root@192.168.9.1:/tmp/
+curl -LO "https://github.com/shangjie1998/airsim-m8-openwrt/releases/download/v0.1.0.25-r22-m8/airsim-m8-0.1.0.24-r22-m8.tar.gz"
+scp airsim-m8-0.1.0.25-r22-m8.tar.gz root@192.168.9.1:/tmp/
 
 # 设备侧：解包安装（设备侧直接写系统路径会失败，必须先落 /tmp）
 ssh root@192.168.9.1
 mkdir -p /tmp/m8pkg && cd /tmp/m8pkg
-tar xzf /tmp/airsim-m8-0.1.0.24-r22-m8.tar.gz -C /tmp/m8pkg
+tar xzf /tmp/airsim-m8-0.1.0.25-r22-m8.tar.gz -C /tmp/m8pkg
 sh install.sh
 ```
 

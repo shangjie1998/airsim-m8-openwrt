@@ -189,7 +189,9 @@ poll_once() {
 		_direction=$(field "$_act" direction)
 	fi
 
-	_cur="$_id|$_state|$_number"
+	# Keep the direction too: on hangup the active view is already empty, and a
+	# template that prints {direction} must not go blank.
+	_cur="$_id|$_state|$_number|$_direction"
 	_prev=$(cat "$STATE_FILE" 2>/dev/null)
 	[ "$_cur" = "$_prev" ] && return 0
 	printf '%s' "$_cur" > "$STATE_FILE" 2>/dev/null
@@ -197,17 +199,21 @@ poll_once() {
 	if [ -z "$_state" ]; then
 		_old_state=$(printf '%s' "$_prev" | cut -d'|' -f2)
 		_old_number=$(printf '%s' "$_prev" | cut -d'|' -f3)
+		_old_dir=$(printf '%s' "$_prev" | cut -d'|' -f4)
 		[ -n "$_old_state" ] || return 0
 		case "$_old_state" in
-		ringing) notify_enabled missed && send_event missed "$_old_number" ended incoming ;;
-		*)       notify_enabled ended && send_event ended "$_old_number" ended "$_direction" ;;
+		# Never answered: ringing on either naming of the inbound state.
+		incoming|ringing) notify_enabled missed && send_event missed "$_old_number" ended "$_old_dir" ;;
+		*)                notify_enabled ended && send_event ended "$_old_number" ended "$_old_dir" ;;
 		esac
 		return 0
 	fi
 
 	case "$_state" in
-	ringing) notify_enabled ringing && send_event ringing "$_number" "$_state" "$_direction" ;;
-	active)  notify_enabled answered && send_event answered "$_number" "$_state" "$_direction" ;;
+	# The AirSIM agent names the inbound state "incoming"; older builds said
+	# "ringing". Both mean the same thing to a notification reader.
+	incoming|ringing) notify_enabled ringing && send_event ringing "$_number" "$_state" "$_direction" ;;
+	active|answered)  notify_enabled answered && send_event answered "$_number" "$_state" "$_direction" ;;
 	esac
 }
 

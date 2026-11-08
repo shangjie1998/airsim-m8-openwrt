@@ -9,7 +9,7 @@
 
 - 上游项目：[kai-wu-cortex/airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)
 - 本适配仓库：<https://github.com/shangjie1998/airsim-m8-openwrt>
-- 当前已验收版本：**`0.1.0.24-r22-m8`**（详见 [版本口径](#版本口径)）
+- 当前已验收版本：**`0.1.0.25-r22-m8`**（详见 [版本口径](#版本口径)）
 
 > 感谢上游作者 **kai-wu-cortex** 开源 [airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)。
 > 本仓库的 daemon、Agent、LuCI 页面、AirSIM 协议实现全部来自上游；这里做的是"让同一套东西在
@@ -238,12 +238,12 @@ scts: <SCTS 时间串>
 
 ```sh
 # 1. 把安装包传到设备 /tmp（scp 直写系统路径会失败，必须先落 /tmp）
-scp "airsim-m8-0.1.0.24-r22-m8.tar.gz" root@192.168.9.1:/tmp/
+scp "airsim-m8-0.1.0.25-r22-m8.tar.gz" root@192.168.9.1:/tmp/
 
 # 2. 设备侧解包安装
 ssh root@192.168.9.1
 mkdir -p /tmp/m8pkg && cd /tmp/m8pkg
-tar xzf "/tmp/airsim-m8-0.1.0.24-r22-m8.tar.gz" -C /tmp/m8pkg
+tar xzf "/tmp/airsim-m8-0.1.0.25-r22-m8.tar.gz" -C /tmp/m8pkg
 sh install.sh
 ```
 
