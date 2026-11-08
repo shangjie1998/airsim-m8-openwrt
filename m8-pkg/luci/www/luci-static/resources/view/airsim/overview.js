@@ -5,16 +5,143 @@
 'require view.airsim.sms as sms';
 
 var getStatus = rpc.declare({ object: 'airsim', method: 'status', expect: {} });
-var callAction = rpc.declare({ object: 'airsim', method: 'call_action', params: ['action', 'number', 'call_id', 'operation_id'], expect: {}, reject: true, nobatch: true });
+var callAction = rpc.declare({ object: 'airsim', method: 'call_action', params: ['action', 'number', 'call_id', 'operation_id', 'card'], expect: {}, reject: true, nobatch: true });
+// Both cards' numbers come from the SMS backend, which already probes each slot.
+var getSims = rpc.declare({ object: 'airsim-sms', method: 'sms_sims', expect: {}, reject: true, nobatch: true });
+// Paired-client pruning. The list is read-only metadata; removing entries is
+// destructive from the phone's point of view, so the UI confirms twice.
+var getPairClients = rpc.declare({ object: 'airsim', method: 'pair_clients', expect: {}, reject: true, nobatch: true });
+var removePairClients = rpc.declare({ object: 'airsim', method: 'pair_remove', params: ['indexes'], expect: {}, reject: true, nobatch: true });
 var actions = {};
 ['start', 'stop', 'pair_start', 'pair_cancel', 'number_refresh'].forEach(function(name) {
  actions[name] = rpc.declare({ object: 'airsim', method: name, expect: {} });
 });
 
+// ---- 已配对客户端管理 ------------------------------------------------------
+// 配对表里只有不透明的密钥，没有名字，所以只能按序号 + 尾号识别。删除对
+// iPhone 是破坏性的（要重新配对），因此走「勾选 → 二次确认」两步。
+var pairOverlay = null;
+
+function pairStamp(ts) {
+ if (!ts) return '尚未使用';
+ try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return '—'; }
+}
+
+function pairStateTag(client) {
+ if (client.online) return E('span', { 'class': 'as-pair-time as-pair-online' }, '在线');
+ if (!client.last_used) return E('span', { 'class': 'as-pair-time' }, '尚未使用');
+ return E('span', { 'class': 'as-pair-time' }, '上次 ' + pairStamp(client.last_used));
+}
+
+function pairClose() {
+ if (!pairOverlay) return;
+ if (pairOverlay.parentNode) pairOverlay.parentNode.removeChild(pairOverlay);
+ pairOverlay = null;
+ document.removeEventListener('keydown', pairEscape);
+}
+
+function pairEscape(ev) { if (ev.key === 'Escape') pairClose(); }
+
+function pairButton(label, className, handler) {
+ return E('button', { 'type': 'button', 'class': 'as-button ' + className, 'click': handler }, label);
+}
+
+function openPairManager() {
+ if (pairOverlay) return;
+ pairOverlay = E('div', { 'class': 'as-modal-mask' });
+ var box = E('div', { 'class': 'as-modal', 'role': 'dialog', 'aria-modal': 'true', 'aria-label': '已配对客户端' });
+ pairOverlay.appendChild(box);
+ pairOverlay.addEventListener('click', function(ev) { if (ev.target === pairOverlay) pairClose(); });
+ document.addEventListener('keydown', pairEscape);
+ document.body.appendChild(pairOverlay);
+ box.appendChild(E('h3', {}, '已配对客户端'));
+ box.appendChild(E('p', { 'class': 'as-copy as-modal-copy' }, '正在读取配对列表…'));
+ getPairClients().then(function(result) {
+  if (pairOverlay) pairStepList(box, result || {});
+ }).catch(function() {
+  if (pairOverlay) pairStepList(box, {error: '无法读取配对列表，请确认 AirSIM 服务正在运行。'});
+ });
+}
+
+function pairStepList(box, result) {
+ box.textContent = '';
+ box.appendChild(E('h3', {}, '已配对客户端'));
+ if (result.error) {
+  box.appendChild(E('p', { 'class': 'as-copy as-modal-copy as-modal-warn' }, result.error));
+  box.appendChild(E('div', { 'class': 'as-modal-actions' }, [pairButton('关闭', 'as-secondary', pairClose)]));
+  return;
+ }
+ var clients = result.clients || [];
+ if (!clients.length) {
+  box.appendChild(E('p', { 'class': 'as-copy as-modal-copy' }, '当前没有已配对的客户端。'));
+  box.appendChild(E('div', { 'class': 'as-modal-actions' }, [pairButton('关闭', 'as-secondary', pairClose)]));
+  return;
+ }
+ box.appendChild(E('p', { 'class': 'as-copy as-modal-copy' }, '共 ' + clients.length + ' 个客户端已配对。勾选要删除的条目；删除后那台设备必须重新配对才能连接。'));
+ var chosen = [], removeButton;
+ var list = E('div', { 'class': 'as-pair-list' });
+ clients.forEach(function(client) {
+  var check = E('input', { 'type': 'checkbox', 'class': 'as-pair-check' });
+  check.addEventListener('change', function() {
+   var at = chosen.indexOf(client.index);
+   if (check.checked && at < 0) chosen.push(client.index);
+   else if (!check.checked && at >= 0) chosen.splice(at, 1);
+   removeButton.disabled = chosen.length === 0;
+  });
+  list.appendChild(E('label', { 'class': 'as-pair-item' }, [
+   check,
+   E('span', { 'class': 'as-pair-main' }, '客户端 ' + client.index + ' · 密钥尾号 ' + client.fingerprint),
+   pairStateTag(client)
+  ]));
+ });
+ box.appendChild(list);
+ removeButton = pairButton('删除选中', 'as-danger', function() { pairStepConfirm(box, clients, chosen.slice()); });
+ removeButton.disabled = true;
+ box.appendChild(E('div', { 'class': 'as-modal-actions' }, [pairButton('取消', 'as-secondary', pairClose), removeButton]));
+}
+
+function pairStepConfirm(box, clients, chosen) {
+ box.textContent = '';
+ var targets = clients.filter(function(client) { return chosen.indexOf(client.index) >= 0; });
+ box.appendChild(E('h3', {}, '确认删除这 ' + targets.length + ' 个客户端？'));
+ box.appendChild(E('p', { 'class': 'as-copy as-modal-copy as-modal-warn' },
+  '此操作不可恢复：删除后对应设备必须重新输入六位配对码才能再次连接。'));
+ var list = E('div', { 'class': 'as-pair-list' });
+ targets.forEach(function(client) {
+  list.appendChild(E('div', { 'class': 'as-pair-item as-pair-item-static' }, [
+   E('span', { 'class': 'as-pair-main' }, '客户端 ' + client.index + ' · 密钥尾号 ' + client.fingerprint),
+   pairStateTag(client)
+  ]));
+ });
+ box.appendChild(list);
+ var confirmButton = pairButton('确认删除', 'as-danger', function() {
+  confirmButton.disabled = true;
+  confirmButton.textContent = '正在删除…';
+  removePairClients(chosen.join(',')).then(function(result) {
+   pairStepDone(box, result || {});
+  }).catch(function() {
+   confirmButton.disabled = false;
+   confirmButton.textContent = '确认删除';
+   box.appendChild(E('p', { 'class': 'as-copy as-modal-warn' }, '没有收到设备确认，请稍后重试或先检查服务状态。'));
+  });
+ });
+ box.appendChild(E('div', { 'class': 'as-modal-actions' }, [
+  pairButton('返回', 'as-secondary', function() { pairStepList(box, {clients: clients}); }),
+  confirmButton
+ ]));
+}
+
+function pairStepDone(box, result) {
+ box.textContent = '';
+ box.appendChild(E('h3', {}, '已删除 ' + (result.removed || 0) + ' 个客户端'));
+ box.appendChild(E('p', { 'class': 'as-copy as-modal-copy' }, '现在还有 ' + (result.total || 0) + ' 个已配对客户端。'));
+ box.appendChild(E('div', { 'class': 'as-modal-actions' }, [pairButton('完成', 'as-secondary', pairClose)]));
+}
+
 return view.extend({
  load: function() { return getStatus(); },
  render: function(data) {
-  var current = data || {}, pending = '', previousVersion = '', callOptions = '', dialAttempt = null;
+  var current = data || {}, pending = '', previousVersion = '', callOptions = '', dialAttempt = null, simsState = null;
   var root, nodes = {}, buttons = {};
   function text(key, tag, className, content) {
    nodes[key] = E(tag, { 'class': className || '' }, content || '');
@@ -41,7 +168,8 @@ return view.extend({
    var target = calls.find(function(c) { return c.id === nodes.callSelect.value; });
    nodes.callSelect.disabled = !!pending || !available || !calls.length;
    nodes.dialNumber.disabled = !!pending || !available || !!calls.length;
-   buttons.dial.disabled = !!pending || !available || !!calls.length || !nodes.dialNumber.value.trim();
+   nodes.dialCard.disabled = !!pending || !available || !!calls.length;
+   buttons.dial.disabled = !!pending || !available || !!calls.length || !nodes.dialNumber.value.trim() || !dialCardPresent();
    buttons.answer.disabled = !!pending || !available || !target || ['incoming', 'waiting'].indexOf(target.state) < 0;
    buttons.hangup.disabled = !!pending || !available || !target;
    buttons.dial.textContent = pending === 'dial' ? '正在拨号…' : '拨号';
@@ -77,6 +205,7 @@ return view.extend({
    set('sim', !online ? '等待服务启动' : sim.sim_inserted ? '已就绪' : '未就绪');
    set('network', sim.reg_status_text || '等待检测');
    set('signal', sim.signal_dbm != null ? sim.signal_dbm + ' dBm' : '基带暂未提供');
+   set('battery', sim.battery ? sim.battery.percent + '%' + (sim.battery.charging ? '（充电中）' : '（未充电）') : '读取中');
    set('call', s.call_active ? '通话进行中' : online ? '待机' : '—');
    set('audio', setupBlocked ? s.audio_setup === 'reboot_required' ? '需重启完成准备' : '尚未准备完成' : s.audio_available ? '已识别' : '等待检测');
    set('address', s.lan_ip || '—');
@@ -140,26 +269,42 @@ return view.extend({
     message('error', '操作未完成', err.message || '无法连接设备，请稍后重试。');
    } finally { pending = ''; refresh(current); }
   }
+  // 卡槽没插卡就别让按下去；sims 还没读到时不拦，交给设备侧报错。
+  function dialCardPresent() {
+   var value = nodes.dialCard.value;
+   if (value !== '0' && value !== '1') return false;
+   if (!simsState || !Array.isArray(simsState.sims)) return true;
+   var sim = simsState.sims[Number(value)];
+   return !!(sim && sim.present);
+  }
+  function dialCardLabel() {
+   var value = nodes.dialCard.value;
+   return value === '0' ? 'SIM1' : value === '1' ? 'SIM2' : '所选卡';
+  }
   async function runCall(action) {
    if (pending || buttons[action].disabled) return;
    var number = nodes.dialNumber.value.trim().replace(/[ ()-]/g, ''), id = nodes.callSelect.value, operation = '';
    if (action === 'dial') {
+    if (!dialCardPresent()) { callMessage('error', '卡槽是空的', '所选的 ' + dialCardLabel() + ' 卡槽没有插卡，请换一张在位的卡再拨号。'); return; }
     if (!/^\+?[0-9]{3,20}$/.test(number)) { callMessage('error', '号码格式不正确', '请输入 3–20 位数字，可在开头使用 +。'); nodes.dialNumber.focus(); return; }
-    if (dialAttempt && dialAttempt.number !== number) { callMessage('error', '上次拨号结果待确认', '请先检查上次通话状态；不会把未确认请求改拨到其他号码。'); return; }
+    // The card is part of the dial identity: switching cards for the same number
+    // is a different call and has to get its own operation id.
+    var card = nodes.dialCard.value;
+    if (dialAttempt && (dialAttempt.number !== number || dialAttempt.card !== card)) { callMessage('error', '上次拨号结果待确认', '请先检查上次通话状态；不会把未确认请求改拨到其他号码。'); return; }
     if (!dialAttempt) {
      // crypto.randomUUID may not be available on OpenWrt's HTTP origin.
      var random = new Uint8Array(16); crypto.getRandomValues(random);
-     dialAttempt = { number: number, id: Array.from(random).map(function(n) { return n.toString(16).padStart(2, '0'); }).join('') };
+     dialAttempt = { number: number, card: card, id: Array.from(random).map(function(n) { return n.toString(16).padStart(2, '0'); }).join('') };
     }
     operation = dialAttempt.id;
    } else if (!id) return;
    pending = action; refresh(current);
    callMessage('pending', action === 'dial' ? '正在发起拨号' : action === 'answer' ? '正在接听所选通话' : '正在挂断所选通话', '正在等待 VIPME-M8 确认，请勿重复操作。');
    try {
-    var result = await callAction(action, action === 'dial' ? number : '', id, operation);
+    var result = await callAction(action, action === 'dial' ? number : '', id, operation, action === 'dial' ? nodes.dialCard.value : '');
     if (!result.ok || result.error) throw new Error(result.error || '未收到有效操作回执，请先查看实时状态。');
     if (action === 'dial') dialAttempt = null;
-    callMessage('success', action === 'dial' ? '拨号已发起' : action === 'answer' ? '所选通话已接听' : '所选通话已挂断', action === 'dial' ? '请等待对方接听，下方状态会自动更新。浏览器不提供通话音频。' : action === 'answer' ? '请检查 AirSIM 客户端的音频连接；浏览器不传输声音。' : '其他通话不会被自动挂断。');
+    callMessage('success', action === 'dial' ? '拨号已发起' : action === 'answer' ? '所选通话已接听' : '所选通话已挂断', action === 'dial' ? '已从' + dialCardLabel() + '拨出，请等待对方接听，下方状态会自动更新。浏览器不提供通话音频。' : action === 'answer' ? '请检查 AirSIM 客户端的音频连接；浏览器不传输声音。' : '其他通话不会被自动挂断。');
     try { refresh(await getStatus()); } catch (_) { callMessage('info', '操作已确认，状态刷新暂不可用', '请等待自动刷新，不要重复拨号。'); }
    } catch (err) {
     callMessage('error', '通话操作未完成', (err.message || '网络请求失败') + (action === 'dial' ? ' 若重试相同号码，将复用本次操作编号，不重复发送拨号。' : ''));
@@ -170,15 +315,58 @@ return view.extend({
   ]);
   nodes.callFeedback = E('div', { 'class': 'as-feedback', 'role': 'status', 'aria-live': 'polite', 'hidden': true }, [text('callFeedbackTitle', 'strong'), text('callFeedbackDescription', 'p')]);
   nodes.dialNumber = E('input', { id: 'as-dial-number', type: 'tel', inputmode: 'tel', autocomplete: 'off', maxlength: 32, placeholder: '输入电话号码', 'class': 'as-dial-input', 'aria-describedby': 'as-dial-help', input: function() { syncCalls(current); }, keydown: function(event) { if (event.key === 'Enter') { event.preventDefault(); runCall('dial'); } } });
+  nodes.dialCard = E('select', { id: 'as-dial-card', 'class': 'as-call-select', change: function() { dialCardInit = true; syncCalls(current); } }, [
+   E('option', { value: '0' }, 'SIM1'), E('option', { value: '1' }, 'SIM2')
+  ]);
   nodes.callSelect = E('select', { id: 'as-call-select', 'class': 'as-call-select', change: function() { syncCalls(current); } }, [E('option', { value: '' }, '当前没有通话')]);
+  var dialCardInit = false;
+  var simsLine = E('p', { 'class': 'as-caption as-sims-line' }, '正在读取两张 SIM 卡…');
+  async function loadSims() {
+   try {
+    var r = await getSims();
+    if (!r || !Array.isArray(r.sims)) return;
+    var present = r.sims.filter(function(s) { return s && s.present; });
+    simsLine.textContent = present.length
+     ? '在位卡：' + present.map(function(s) {
+        var label = s.name + ' ' + (s.number || '号码未知') + (s.operator ? '（' + s.operator + '）' : '');
+        // The baseband measures one tray at a time: only the tray the data
+        // connection rides on has a live level, the idle one reads a frozen
+        // placeholder, so it must not show a number.
+        var mod = (current && current.sim) || {};
+        if (s.card === (r.current != null ? Number(r.current) : -1))
+         label += mod.signal_dbm != null ? ' ' + mod.signal_dbm + ' dBm' : ' 信号读取中';
+        else label += ' 未驻留 · 无实时测量';
+        return label;
+       }).join(' · ')
+     : '未检测到在位 SIM 卡。';
+    // 下拉只列两张卡：默认落在当前数据卡那张，那张空着就退到另一张。
+    if (!dialCardInit) {
+     var prefer = String(r.current) === '1' ? '1' : '0';
+     var prefSim = r.sims[Number(prefer)];
+     if (!prefSim || !prefSim.present) {
+      var other = prefer === '0' ? '1' : '0';
+      var otherSim = r.sims[Number(other)];
+      if (otherSim && otherSim.present) prefer = other;
+     }
+     nodes.dialCard.value = prefer; dialCardInit = true;
+    }
+    [0, 1].forEach(function(i) {
+     var sim = r.sims[i], option = nodes.dialCard && nodes.dialCard.querySelectorAll('option')[i];
+     if (!option) return;
+     option.disabled = !sim || !sim.present;
+     option.textContent = sim && sim.present ? sim.name + (sim.number ? ' ' + sim.number : '') : 'SIM' + (i + 1) + '（卡槽空）';
+    });
+    syncCalls(current);
+   } catch (_) { simsLine.textContent = '两张 SIM 卡信息读取失败，拨出卡按 SIM1/SIM2 选择。'; }
+  }
   root = E('div', { 'class': 'as-root' }, [
    E('link', { 'rel': 'stylesheet', 'href': L.resource('view/airsim/overview.css') }),
    E('header', { 'class': 'as-header' }, [E('div', {}, [E('div', { 'class': 'as-eyebrow' }, 'AirSIM · 电话网关'), E('h2', {}, '让连接，简单一点。'), E('p', {}, 'VIPME-M8 的运行状态与客户端连接，在这里管理。')]), text('version', 'span', 'as-version')]),
    E('div', { 'class': 'as-layout' }, [
     E('section', { 'class': 'as-card as-status', 'aria-label': '设备状态' }, [
      E('div', { 'class': 'as-card-heading' }, [E('h3', {}, '设备状态'), text('live', 'span', 'as-pill')]),
-     E('div', { 'class': 'as-number-block' }, [E('span', { 'class': 'as-label' }, 'SIM 本机号码'), text('number', 'div', 'as-number'), text('numberHint', 'p', 'as-caption')]),
-     E('dl', { 'class': 'as-status-list' }, [row('SIM 卡', 'sim'), row('移动网络', 'network'), row('信号强度', 'signal'), row('当前通话', 'call'), row('音频设备', 'audio'), row('设备地址', 'address')]),
+     E('div', { 'class': 'as-number-block' }, [E('span', { 'class': 'as-label' }, 'SIM 本机号码'), text('number', 'div', 'as-number'), text('numberHint', 'p', 'as-caption'), simsLine]),
+     E('dl', { 'class': 'as-status-list' }, [row('SIM 卡', 'sim'), row('移动网络', 'network'), row('信号强度', 'signal'), row('设备电量', 'battery'), row('当前通话', 'call'), row('音频设备', 'audio'), row('设备地址', 'address')]),
      E('details', { 'class': 'as-details' }, [E('summary', {}, '连接与诊断'), E('dl', {}, [row('云端 Relay', 'relay'), row('上行 / 下行帧', 'frames'), row('最近音频错误', 'audioError')]), text('relayError', 'p', 'as-technical')]),
      text('updated', 'p', 'as-updated')
     ]),
@@ -192,13 +380,15 @@ return view.extend({
       E('div', { 'class': 'as-step-heading' }, [E('span', { 'class': 'as-step' }, '02'), E('h3', {}, '配对客户端')]),
       E('p', { 'class': 'as-copy' }, '让 iPhone 与 VIPME-M8 处于同一局域网。'),
       E('div', { 'class': 'as-code-area' }, [text('discovery', 'p', 'as-discovery'), text('code', 'div', 'as-code'), text('countdown', 'p', 'as-caption')]),
-      E('div', { 'class': 'as-buttons' }, [button('获取配对码', 'pair_start', 'as-primary'), button('关闭配对', 'pair_cancel', 'as-secondary')]),
+      E('div', { 'class': 'as-buttons' }, [button('获取配对码', 'pair_start', 'as-primary'), button('关闭配对', 'pair_cancel', 'as-secondary'),
+       E('button', { 'type': 'button', 'class': 'as-button as-secondary', 'click': function() { return openPairManager(); } }, '清除历史配对')]),
       E('ol', { 'class': 'as-instructions' }, [E('li', {}, '在 AirSIM 中打开“添加设备”。'), E('li', {}, '选择自动发现的 AirSIM-VIPME-M8。'), E('li', {}, '输入上方六位配对码，完成连接。')])
      ])
     ]),
     E('section', { 'class': 'as-card as-dial', 'aria-label': '拨号与通话' }, [
      E('div', { 'class': 'as-step-heading' }, [E('span', { 'class': 'as-step' }, '03'), E('h3', {}, '拨号与通话')]),
      E('p', { 'class': 'as-copy' }, '使用 VIPME-M8 的 SIM 卡发起电话。'),
+     E('label', { 'for': 'as-dial-card', 'class': 'as-field-label' }, '拨出卡'), nodes.dialCard,
      E('label', { 'for': 'as-dial-number', 'class': 'as-field-label' }, '拨打号码'),
      E('div', { 'class': 'as-dial-entry' }, [nodes.dialNumber, button('拨号', 'dial', 'as-primary')]),
      E('p', { id: 'as-dial-help', 'class': 'as-caption' }, '可能产生运营商通话费用。本页仅控制通话，不提供浏览器音频。'),
@@ -212,6 +402,7 @@ return view.extend({
    E('footer', { 'class': 'as-footer' }, 'AirSIM for VIPME-M8 · 开发预览版')
   ]);
   refresh(current);
+  loadSims();
   poll.add(function() {
    if (pending) return Promise.resolve();
    return getStatus().then(refresh).catch(function() { current = Object.assign({}, current, { calls: { available: false, error: '状态更新失败，通话操作已暂停' } }); syncCalls(current); message('error', '状态更新失败', '无法连接设备，请检查网络。'); });

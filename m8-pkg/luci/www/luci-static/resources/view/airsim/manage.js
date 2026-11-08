@@ -12,6 +12,10 @@ var updateStatus = rpc.declare({object:'airsim', method:'updates_status', expect
 var updatePolicy = rpc.declare({object:'airsim', method:'updates_policy', params:['config'], expect:{}, reject:true, nobatch:true});
 var installUpdate = rpc.declare({object:'airsim', method:'update_install', params:['tag'], expect:{}, reject:true, nobatch:true});
 var releasesURL = 'https://github.com/kai-wu-cortex/airsim-mu300/releases';
+// The Agent never hardcodes a relay host: it uses whatever the iPhone sends when
+// it pairs. This is the official cloud channel that ships with the client, shown
+// here so it can be seen, replaced or cleared without hunting through configs.
+var DEFAULT_RELAY = 'https://airsim-push.remotepilot.site';
 
 function validateSettings(s) {
  if (s.mode !== 'local' && s.mode !== 'cloud') return '请选择连接模式。';
@@ -183,14 +187,18 @@ return view.extend({
      E('h3',{},'管理设置'),
      E('label',{'for':'as-setting-mode','class':'as-field-label'},'连接模式'),fields.mode,
      E('p',{'class':'as-caption'},'局域网模式禁用 Relay 注册、心跳和云端命令；云端模式保留局域网通路，但仍须有效的客户端云端配对。'),
-     input('relay_url','Relay HTTPS 地址','url','留空跟随客户端配对地址。更换地址不会转移旧凭据；需在客户端配置相同地址并重新配对。'),
+     input('relay_url','Relay HTTPS 地址','url','官方云通道默认 ' + DEFAULT_RELAY + '。留空即跟随客户端配对时下发的地址；改成自己的地址后，客户端必须用同一地址重新配对。'),
+     E('div',{'class':'as-buttons'},[
+      E('button',{'type':'button','class':'as-text-button',click:function(){ if (fields.relay_url) fields.relay_url.value = DEFAULT_RELAY; }},'填入官方默认'),
+      E('button',{'type':'button','class':'as-text-button',click:function(){ if (fields.relay_url) fields.relay_url.value = ''; }},'改为跟随客户端')
+     ]),
      input('interface','可信 LAN 接口','text','通常为 br-lan。仅绑定该接口的私有 IPv4；不修改路由、防火墙或设备网络。'),
      E('div',{'class':'as-port-fields'},[input('pair_port','配对端口','number'),input('control_port','控制端口','number'),input('pcm_port','PCM 端口','number')]),
      E('p',{'class':'as-caption'},'先在概览页关闭服务，再保存并手动启动。端口变化会通过 Bonjour 公布；客户端需重新发现，必要时重新配对。内部端口保持仅回环访问。'),
      buttons.save,feedback
     ]),
     E('div',{'class':'as-management-stack'},[
-     E('section',{'class':'as-card'},[E('h3',{},'Relay 与运行状态'),relay,runtime,E('p',{'class':'as-caption'},'“已配置”不等于公网可达；命令通道连接也不代表双向语音已验收。')]),
+     E('section',{'class':'as-card'},[E('h3',{},'Relay 与运行状态'),E('p',{'class':'as-copy'},'页面设置：'+(settings.relay_url || '未指定 · 跟随客户端配对地址')+'　官方默认：'+DEFAULT_RELAY),relay,runtime,E('p',{'class':'as-caption'},'“已配置”不等于公网可达；命令通道连接也不代表双向语音已验收。')]),
      E('section',{'class':'as-card'},[E('h3',{},'维护工具'),E('p',{'class':'as-copy'},'导出可分享的状态报告。'),E('p',{'class':'as-caption'},'不读取短信正文，不导出号码、IP、Relay 地址、标识、配对码、密钥、原始日志或音频；不会自动上传。'),buttons.diagnostics,
       E('hr',{}),E('h3',{},'插件更新'),E('label',{'class':'as-check-label','for':'as-auto-update'},[automatic,' 自动检查更新（每 6 小时）']),E('label',{'class':'as-check-label','for':'as-previews'},[previews,' 包含开发预览版']),E('p',{'class':'as-caption'},'自动检查只获取公开版本信息，不自动安装。先在概览关闭电话服务，再更新；安装前验证签名、设备与通话/短信空闲状态。'),buttons.updates,updateResult,buttons.install,confirmation,jobResult,updateLink]),
      E('section',{'class':'as-card'},[E('h3',{},'版本说明'),E('p',{'class':'as-copy'},'当前安装：'+config.version),E('ul',{'class':'as-instructions'},[

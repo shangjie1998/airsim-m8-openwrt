@@ -3,17 +3,21 @@
 'require rpc';
 'require poll';
 
-// Use the firmware's PDU service and its AT lock, never the Agent's text-mode SMS API.
-var listSMS = rpc.declare({ object: 'airsim-sms', method: 'sms_list', params: ['page'], expect: {}, reject: true, nobatch: true });
+// Use the firmware's two-SIM inbox and its per-card submit path, never the Agent's
+// text-mode SMS API: the Agent relays AT through mmcli and only ever sees the
+// primary card, so a message on the second SIM would simply not exist for it.
+var listSMS = rpc.declare({ object: 'airsim-sms', method: 'sms_list', params: ['page', 'card'], expect: {}, reject: true, nobatch: true });
 var showSMS = rpc.declare({ object: 'airsim-sms', method: 'sms_show', params: ['id'], expect: {}, reject: true, nobatch: true });
-var sendSMS = rpc.declare({ object: 'airsim-sms', method: 'sms_send', params: ['num', 'text'], expect: {}, reject: true, nobatch: true });
+var sendSMS = rpc.declare({ object: 'airsim-sms', method: 'sms_send', params: ['num', 'text', 'card'], expect: {}, reject: true, nobatch: true });
 var getJob = rpc.declare({ object: 'airsim-sms', method: 'sms_job', expect: {}, reject: true, nobatch: true });
+var getSims = rpc.declare({ object: 'airsim-sms', method: 'sms_sims', expect: {}, reject: true, nobatch: true });
 
 return baseclass.extend({
  render: function() {
   var page = 1, pages = 1, loading = false, reading = false, checking = false;
   var sending = false, running = false, jobKnown = false, watching = false, uncertain = false;
   var lastList = 0, signature = '', draft = null, selected = '';
+  var filterCard = '', sendCard = '0', sendCardInit = false, simState = null;
   var list = E('div', { 'class': 'as-sms-list', 'aria-label': '短信列表' });
   var count = E('span', { 'class': 'as-pill as-pill-neutral' }, '读取中');
   var listHint = E('p', { 'class': 'as-caption', role: 'status' }, '正在读取设备短信…');
@@ -28,7 +32,9 @@ return baseclass.extend({
   function update() {
    var locked = sending || running || uncertain || !!draft;
    number.disabled = locked; body.disabled = locked;
-   send.disabled = locked || checking || !jobKnown || !valid();
+   sendCardSelect.disabled = locked;
+   filterSelect.disabled = loading;
+   send.disabled = locked || checking || !jobKnown || !valid() || !sendCardPresent();
    confirm.disabled = sending || running || checking || uncertain || !jobKnown || !draft;
    cancel.disabled = sending;
    ack.hidden = !uncertain; ack.disabled = sending || running || !jobKnown;
@@ -40,25 +46,28 @@ return baseclass.extend({
    if (loading) return;
    loading = true; update();
    try {
-    var result = await listSMS(String(page));
+    var result = await listSMS(String(page), filterCard);
     if (!result || result.error || !Array.isArray(result.msgs)) throw new Error('unavailable');
     pages = Math.max(1, Number(result.pages) || 1);
     if (page > pages) { page = pages; signature = ''; return; }
     count.textContent = (Number(result.unread) || 0) + ' 条未读';
-    listHint.textContent = '共 ' + (Number(result.total) || 0) + ' 条 · 第 ' + page + ' / ' + pages + ' 页 · 自动刷新';
+    var scope = filterCard === '' ? '全部 SIM' : 'SIM' + (Number(filterCard) + 1);
+    listHint.textContent = scope + ' · 共 ' + (Number(result.total) || 0) + ' 条 · 第 ' + page + ' / ' + pages + ' 页 · 自动刷新';
     var current = JSON.stringify(result.msgs);
     if (current !== signature) {
      list.replaceChildren();
      result.msgs.forEach(function(m) {
-      if (!/^[0-9]{1,6}$/.test(String(m.id))) return;
+      if (!/^[0-9]{1,12}$/.test(String(m.id))) return;
       var read = button(m.status === 'unread' ? '查看全文 · 标记已读' : '查看全文', function() { return openMessage(String(m.id), String(m.peer || '未知号码')); }, 'as-text-button');
+      var sim = String(m.sim || (m.card === '0' ? 'SIM1' : m.card === '1' ? 'SIM2' : '来源未知'));
       list.appendChild(E('article', { 'class': 'as-sms-item' }, [
-       E('div', { 'class': 'as-sms-meta' }, [E('strong', {}, String(m.peer || '未知号码')), E('span', {}, m.dir === 'mo' ? '已发送' : m.status === 'unread' ? '未读' : '已读')]),
+       E('div', { 'class': 'as-sms-meta' }, [E('strong', {}, String(m.peer || '未知号码')),
+        E('span', { 'class': 'as-sim-tag' }, sim), E('span', {}, m.dir === 'mo' ? '已发送' : m.status === 'unread' ? '未读' : '已读')]),
        E('p', { 'class': 'as-caption' }, String(m.time || '时间未知')),
        E('p', { 'class': 'as-sms-preview' }, String(m.preview || '（无预览）')), read
       ]));
      });
-     if (!result.msgs.length) list.appendChild(E('p', { 'class': 'as-caption' }, '暂无短信。新短信由设备原生服务自动接收。'));
+     if (!result.msgs.length) list.appendChild(E('p', { 'class': 'as-caption' }, filterCard === '' ? '暂无短信。新短信由设备原生服务自动接收。' : '这张卡下暂无短信。'));
      signature = current;
     }
    } catch (_) { listHint.textContent = '短信读取失败。请确认 AirSIM 短信服务 airsim-sms 已运行，并稍后刷新。'; }
@@ -99,10 +108,68 @@ return baseclass.extend({
     message('error', '无法确认设备发送任务状态，已暂停发送。网络恢复后自动查询，不会自动重发。');
    } finally { checking = false; update(); }
   }
+  // 发送卡槽没插卡就不让发；sims 还没读到时不拦。
+  function sendCardPresent() {
+   if (sendCard !== '0' && sendCard !== '1') return false;
+   if (!simState || !Array.isArray(simState.sims)) return true;
+   var sim = simState.sims[Number(sendCard)];
+   return !!(sim && sim.present);
+  }
+  function cardName(value) {
+   if (value === '0') return 'SIM1';
+   if (value === '1') return 'SIM2';
+   return '所选卡';
+  }
+  var filterSelect = E('select', { id: 'as-sms-filter', 'class': 'as-call-select', change: function() {
+   filterCard = filterSelect.value; page = 1; signature = ''; return refreshList();
+  } }, [
+   E('option', { value: '' }, '全部 SIM'), E('option', { value: '0' }, 'SIM1'), E('option', { value: '1' }, 'SIM2')
+  ]);
+  var sendCardSelect = E('select', { id: 'as-sms-card', 'class': 'as-call-select', change: function() {
+   sendCard = sendCardSelect.value; sendCardInit = true; update();
+  } }, [
+   E('option', { value: '0' }, 'SIM1'), E('option', { value: '1' }, 'SIM2')
+  ]);
+  var simsInfo = E('p', { 'class': 'as-caption' }, '正在读取两张 SIM 卡…');
+  async function loadSims() {
+   try {
+    var r = await getSims();
+    if (!r || r.error || !Array.isArray(r.sims)) return;
+    simState = r;
+    var present = r.sims.filter(function(s) { return s && s.present; });
+    simsInfo.textContent = present.length
+     ? '在位卡：' + present.map(function(s) {
+        return s.name + ' ' + (s.number || '号码未知') + (s.operator ? '（' + s.operator + '）' : '');
+       }).join(' · ')
+     : '未检测到在位 SIM 卡。';
+    // 发送卡只列两张实卡：默认落在当前数据卡那张，那张空着就退到另一张。
+    if (!sendCardInit) {
+     var prefer = String(r.current) === '1' ? '1' : '0';
+     var prefSim = r.sims[Number(prefer)];
+     if (!prefSim || !prefSim.present) {
+      var other = prefer === '0' ? '1' : '0';
+      var otherSim = r.sims[Number(other)];
+      if (otherSim && otherSim.present) prefer = other;
+     }
+     sendCard = prefer; sendCardSelect.value = prefer; sendCardInit = true;
+    }
+    [0, 1].forEach(function(i) {
+     var s = r.sims[i];
+     var sopt = sendCardSelect.querySelectorAll('option')[i];
+     if (sopt) {
+      sopt.disabled = !s || !s.present;
+      sopt.textContent = s && s.present ? (s.name + (s.number ? ' ' + s.number : '')) : 'SIM' + (i + 1) + '（卡槽空）';
+     }
+     var fopt = filterSelect.querySelectorAll('option')[i + 1];
+     if (fopt) fopt.disabled = !s || !s.present;
+    });
+   } catch (_) { simsInfo.textContent = '两张 SIM 卡信息读取失败，发送卡请选 SIM1 / SIM2。'; }
+  }
   function prepare() {
+   if (!sendCardPresent()) { message('error', '所选的 ' + cardName(sendCard) + ' 卡槽是空的，请换一张在位的卡再发送。'); return; }
    if (send.disabled || !valid()) return;
-   draft = { number: number.value.trim(), text: body.value };
-   confirmationText.textContent = '确认发送至 ' + draft.number + '？将使用 VIPME-M8 的 SIM 卡，可能产生短信费用。';
+   draft = { number: number.value.trim(), text: body.value, card: sendCard };
+   confirmationText.textContent = '确认发送至 ' + draft.number + '？将从 ' + cardName(draft.card) + ' 发出，可能产生短信费用。';
    confirmationBody.textContent = draft.text;
    confirmation.hidden = false; update(); confirm.focus();
   }
@@ -110,7 +177,7 @@ return baseclass.extend({
    if (confirm.disabled || !draft || sending) return;
    sending = true; update(); message('pending', '正在提交短信，请勿重复操作…');
    try {
-    var result = await sendSMS(draft.number, draft.text);
+    var result = await sendSMS(draft.number, draft.text, draft.card);
     if (result && result.ok && result.started) {
      running = true; watching = true;
      message('pending', '短信已排入设备发送任务，正在等待基带确认。');
@@ -142,16 +209,20 @@ return baseclass.extend({
   full.appendChild(close);
   var root = E('section', { 'class': 'as-card as-sms', 'aria-label': '短信' }, [
    E('div', { 'class': 'as-card-heading' }, [E('h3', {}, '短信'), count]),
-   E('p', { 'class': 'as-copy' }, '查看与发送 VIPME-M8 SIM 卡的短信。'),
-   refresh, listHint, list, E('div', { 'class': 'as-buttons as-sms-pages' }, [previous, next]), full,
+   E('p', { 'class': 'as-copy' }, '查看与发送 VIPME-M8 两张 SIM 卡的短信。'),
+   simsInfo,
+   E('div', { 'class': 'as-sms-toolbar' }, [E('label', { 'for': 'as-sms-filter', 'class': 'as-field-label' }, '查看卡'), filterSelect, refresh]),
+   listHint, list, E('div', { 'class': 'as-buttons as-sms-pages' }, [previous, next]), full,
    E('div', { 'class': 'as-sms-compose' }, [
-    E('h4', {}, '新短信'), E('label', { 'for': 'as-sms-number', 'class': 'as-field-label' }, '收件号码'), number,
+    E('h4', {}, '新短信'),
+    E('label', { 'for': 'as-sms-card', 'class': 'as-field-label' }, '发送卡'), sendCardSelect,
+    E('label', { 'for': 'as-sms-number', 'class': 'as-field-label' }, '收件号码'), number,
     E('label', { 'for': 'as-sms-text', 'class': 'as-field-label' }, '短信内容'), body, counter,
     E('p', { id: 'as-sms-help', 'class': 'as-caption' }, '本页每条最多 70 字，暂不支持 emoji 和长短信拆分。短信只在本设备管理，不转发至 AirSIM 客户端。'),
     E('div', { 'class': 'as-buttons' }, [send]), confirmation, feedback, ack
    ])
   ]);
-  update(); refreshList(); checkJob();
+  update(); loadSims(); refreshList(); checkJob();
   poll.add(function() {
    return Promise.all([checkJob(), Date.now() - lastList >= 10000 ? refreshList() : Promise.resolve()]);
   }, 2);

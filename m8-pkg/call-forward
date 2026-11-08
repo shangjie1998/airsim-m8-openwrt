@@ -67,12 +67,26 @@ slot_label() {
 	esac
 }
 
+# 号码统一成国际格式。CNUM 各家卡回法不一样：有的回 +8613…，有的回 8613…，
+# 还有中国联通这种回裸的 11 位本地号。网页、短信、推送里必须是同一个样子。
+intl_number() {
+	case "${1:-}" in
+	'') printf '' ;;
+	+*) printf '%s' "$1" ;;
+	86*) [ "${#1}" -ge 12 ] && printf '+%s' "$1" || printf '%s' "$1" ;;
+	1*)  [ "${#1}" -eq 11 ] && printf '+86%s' "$1" || printf '%s' "$1" ;;
+	*)   printf '%s' "$1" ;;
+	esac
+}
+
+
 # Device facts change slowly; the cache keeps every call cheap. This is also
 # where slot presence and each slot's own number are probed, so the poll loop
 # only needs the cheap CLCC query per tick.
 collect_info() {
 	_st=$(wget -q -T 3 -O- http://127.0.0.1:8575/api/status 2>/dev/null)
 	_self=$(printf '%s' "$_st" | sed -n 's/.*"phone_number":"\([^"]*\)".*/\1/p')
+	_self=$(intl_number "$_self")
 	_dbm=$(printf '%s' "$_st" | sed -n 's/.*"signal_dbm":\([^,}]*\).*/\1/p' | tr -d '"')
 	_mm=$(mmcli -m any 2>/dev/null)
 	[ -n "$_self" ] || _self=$(printf '%s' "$_mm" | sed -n 's/.*own: *//p' | head -1 | tr -d ' ')
@@ -99,9 +113,7 @@ collect_info() {
 				_present="$_present $_s"
 				_n=$(MU300_SIM_SLOT=$_s "$AT_BIN" -t 3 "AT+CNUM" 2>/dev/null |
 					sed -n 's/.*"\(+\{0,1\}[0-9]\{5,\}\)".*/\1/p' | head -1)
-				case "$_n" in
-				86*) _n="+$_n" ;;
-				esac
+				_n=$(intl_number "$_n")
 				case "$_s" in
 				0) _self0=$_n ;;
 				1) _self1=$_n ;;

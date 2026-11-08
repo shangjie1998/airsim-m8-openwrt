@@ -37,10 +37,11 @@ type Gateway struct {
 	events          map[string]uint64
 	lastEvent       string
 	lastEventAt     string
+	lastUsed        map[string]int64
 }
 
 func New(path, id string) (*Gateway, error) {
-	g := &Gateway{path: path, id: id, seen: make(map[string]int64), client: &http.Client{Timeout: 75 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	g := &Gateway{path: path, id: id, seen: make(map[string]int64), lastUsed: make(map[string]int64), client: &http.Client{Timeout: 75 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return g, nil
@@ -100,6 +101,15 @@ func (g *Gateway) Add(encoded string) error {
 		}
 	}
 	keys := append(append([]string(nil), g.keys...), encoded)
+	if err := g.saveLocked(keys); err != nil {
+		return err
+	}
+	g.keys = keys
+	return nil
+}
+
+// saveLocked replaces the key file atomically. Callers hold g.mu.
+func (g *Gateway) saveLocked(keys []string) error {
 	b, _ := json.Marshal(keys)
 	f, err := os.OpenFile(g.path+".tmp", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
@@ -118,11 +128,86 @@ func (g *Gateway) Add(encoded string) error {
 	if err != nil {
 		return err
 	}
-	if err = os.Rename(g.path+".tmp", g.path); err != nil {
-		return err
+	return os.Rename(g.path+".tmp", g.path)
+}
+
+// ClientInfo is what the web UI can show about a paired device. The key itself
+// is opaque, so only its tail is exposed to tell the entries apart.
+// clientOnlineWindow is how long a client counts as online after its last
+// authenticated request. The app polls health and long-polls events every few
+// seconds while awake, so a two-minute gap means it is gone.
+const clientOnlineWindow = 120 * time.Second
+
+type ClientInfo struct {
+	Index       int    `json:"index"`
+	Fingerprint string `json:"fingerprint"`
+	LastUsed    int64  `json:"last_used,omitempty"`
+	Online      bool   `json:"online"`
+}
+
+func fingerprint(encoded string) string {
+	if len(encoded) <= 8 {
+		return encoded
+	}
+	return encoded[len(encoded)-8:]
+}
+
+// Clients lists the paired devices in file order, with the last time each one
+// authenticated (0 when it has not been used since the service started).
+func (g *Gateway) Clients() []ClientInfo {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]ClientInfo, 0, len(g.keys))
+	now := time.Now().Unix()
+	for i, encoded := range g.keys {
+		lastUsed := g.lastUsed[encoded]
+		out = append(out, ClientInfo{
+			Index:       i + 1,
+			Fingerprint: fingerprint(encoded),
+			LastUsed:    lastUsed,
+			Online:      lastUsed > 0 && now-lastUsed <= int64(clientOnlineWindow/time.Second),
+		})
+	}
+	return out
+}
+
+// Remove drops the given one-based indexes and persists the remaining keys.
+func (g *Gateway) Remove(indexes []int) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	drop := make(map[int]bool, len(indexes))
+	for _, n := range indexes {
+		if n >= 1 && n <= len(g.keys) {
+			drop[n] = true
+		}
+	}
+	if len(drop) == 0 {
+		return 0, nil
+	}
+	keys := make([]string, 0, len(g.keys))
+	for i, encoded := range g.keys {
+		if drop[i+1] {
+			continue
+		}
+		keys = append(keys, encoded)
+	}
+	if err := g.saveLocked(keys); err != nil {
+		return 0, err
 	}
 	g.keys = keys
-	return nil
+	for encoded := range g.lastUsed {
+		kept := false
+		for _, key := range keys {
+			if key == encoded {
+				kept = true
+				break
+			}
+		}
+		if !kept {
+			delete(g.lastUsed, encoded)
+		}
+	}
+	return len(drop), nil
 }
 func Sign(key []byte, canonical string) string {
 	m := hmac.New(sha256.New, key)
@@ -156,6 +241,10 @@ func (g *Gateway) authenticate(method, path string, body []byte, ts, nonce, sig 
 		key, _ := decode(encoded)
 		if hmac.Equal([]byte(Sign(key, canonical(method, path, body, ts, nonce))), []byte(sig)) {
 			g.seen[nonce] = now + 61
+			if g.lastUsed == nil {
+				g.lastUsed = make(map[string]int64)
+			}
+			g.lastUsed[encoded] = now
 			return key
 		}
 	}

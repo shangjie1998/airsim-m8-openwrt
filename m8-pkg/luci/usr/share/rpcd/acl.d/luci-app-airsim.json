@@ -7,11 +7,18 @@
      "status",
      "settings_get",
      "diagnostics",
-     "updates_status"
+     "updates_status",
+     "pair_clients"
     ],
     "airsim-call": [
      "call_get",
      "call_status"
+    ],
+    "airsim-sms": [
+     "sms_list",
+     "sms_show",
+     "sms_job",
+     "sms_sims"
     ]
    }
   },
@@ -24,6 +31,7 @@
      "update_install",
      "pair_start",
      "pair_cancel",
+     "pair_remove",
      "number_refresh",
      "start",
      "stop",
@@ -33,7 +41,8 @@
      "sms_list",
      "sms_show",
      "sms_send",
-     "sms_job"
+     "sms_job",
+     "sms_sims"
     ],
     "airsim-call": [
      "call_save",

@@ -204,6 +204,8 @@ func main() {
 	admin.HandleFunc("/internal/cloud-early-media", d.gateway.ServeCloudEarlyMedia)
 	admin.HandleFunc("/pair/start", d.startPair)
 	admin.HandleFunc("/pair/cancel", d.cancelPair)
+	admin.HandleFunc("/pair/clients", d.pairClients)
+	admin.HandleFunc("/pair/remove", d.pairRemove)
 	admin.HandleFunc("/number/refresh", d.refreshNumber)
 	admin.HandleFunc("/call/action", d.callAction)
 	public := http.NewServeMux()
@@ -382,7 +384,7 @@ func (d *daemon) agentGet(path string) map[string]any {
 	}
 	// Only return selected status and this SIM's own number; never credentials.
 	result := map[string]any{}
-	for _, key := range []string{"sim_inserted", "signal_dbm", "reg_status_text", "phone_number", "phone_number_status", "phone_number_updated_at", "configured", "cloud_enabled", "command_connected", "management_blocked", "call_push_ready", "last_error", "relay_url"} {
+	for _, key := range []string{"sim_inserted", "signal_dbm", "reg_status_text", "phone_number", "phone_number_status", "phone_number_updated_at", "battery", "configured", "cloud_enabled", "command_connected", "management_blocked", "call_push_ready", "last_error", "relay_url"} {
 		if value, ok := data[key]; ok {
 			result[key] = value
 		}
@@ -442,6 +444,36 @@ func (d *daemon) cancelPair(w http.ResponseWriter, r *http.Request) {
 	}
 	d.closePair("")
 	write(w, 200, map[string]bool{"ok": true})
+}
+
+// pairClients lists the paired clients so the web UI can prune stale ones.
+func (d *daemon) pairClients(w http.ResponseWriter, r *http.Request) {
+	if !method(w, r, "GET") {
+		return
+	}
+	clients := d.gateway.Clients()
+	write(w, 200, map[string]any{"clients": clients, "total": len(clients), "limit": 16})
+}
+
+// pairRemove drops the selected entries. Body: {"indexes":[1,2]}.
+func (d *daemon) pairRemove(w http.ResponseWriter, r *http.Request) {
+	if !method(w, r, "POST") {
+		return
+	}
+	var body struct {
+		Indexes []int `json:"indexes"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		write(w, 400, map[string]string{"error": "invalid_request"})
+		return
+	}
+	removed, err := d.gateway.Remove(body.Indexes)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "save_failed"})
+		return
+	}
+	remaining := d.gateway.Clients()
+	write(w, 200, map[string]any{"ok": true, "removed": removed, "total": len(remaining), "clients": remaining})
 }
 func (d *daemon) closePair(id string) {
 	d.adMu.Lock()

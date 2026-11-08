@@ -20,7 +20,7 @@ service_status() {
 }
 case "$1" in
 list)
-	printf '%s\n' '{"status":{},"settings_get":{},"settings_save":{"config":""},"diagnostics":{},"updates":{"previews":true},"updates_status":{},"updates_policy":{"config":""},"update_install":{"tag":""},"pair_start":{},"pair_cancel":{},"number_refresh":{},"start":{},"stop":{},"call_action":{"action":"","number":"","call_id":"","operation_id":""}}'
+	printf '%s\n' '{"status":{},"settings_get":{},"settings_save":{"config":""},"diagnostics":{},"updates":{"previews":true},"updates_status":{},"updates_policy":{"config":""},"update_install":{"tag":""},"pair_start":{},"pair_cancel":{},"pair_clients":{},"pair_remove":{"indexes":""},"number_refresh":{},"start":{},"stop":{},"call_action":{"action":"","number":"","call_id":"","operation_id":"","card":""}}'
 	;;
 call)
 	case "$2" in
@@ -69,12 +69,14 @@ call)
 		json_get_var number number
 		json_get_var call_id call_id
 		json_get_var operation_id operation_id
+		json_get_var card card
 		case "$action" in dial|answer|hangup) ;; *) printf '%s\n' '{"error":"不支持的通话操作"}'; exit 0 ;; esac
 		json_init
 		json_add_string action "$action"
 		json_add_string number "$number"
 		json_add_string call_id "$call_id"
 		json_add_string operation_id "$operation_id"
+		json_add_string card "$card"
 		payload=$(json_dump)
 		wget -q -T 40 --post-data="$payload" -O - http://127.0.0.1:7581/call/action || printf '%s\n' '{"error":"未收到操作结果，请先检查通话状态，勿重复拨号","uncertain":true}'
 		;;
@@ -84,6 +86,17 @@ call)
 	pair_start|pair_cancel)
 		case "$2" in pair_start) action=start ;; pair_cancel) action=cancel ;; esac
 		wget -q -T 5 --post-data='{}' -O - "http://127.0.0.1:7581/pair/$action" || printf '%s\n' '{"error":"AirSIM service is stopped"}'
+		;;
+	pair_clients)
+		wget -q -T 5 -O - http://127.0.0.1:7581/pair/clients || printf '%s\n' '{"error":"AirSIM service is stopped"}'
+		;;
+	pair_remove)
+		IFS= read -r request
+		if ! json_load "$request"; then printf '%s\n' '{"error":"无效请求"}'; exit 0; fi
+		json_get_var indexes indexes
+		indexes=$(printf '%s' "$indexes" | tr -cd '0-9,')
+		if [ -z "$indexes" ]; then printf '%s\n' '{"error":"未选择要删除的客户端"}'; exit 0; fi
+		wget -q -T 8 --post-data="{\"indexes\":[$indexes]}" -O - http://127.0.0.1:7581/pair/remove || printf '%s\n' '{"error":"AirSIM service is stopped"}'
 		;;
 	number_refresh)
 		wget -q -T 10 --post-data='{}' -O - http://127.0.0.1:7581/number/refresh || printf '%s\n' '{"error":"无法读取号码，请检查服务状态"}'

@@ -1,13 +1,20 @@
 #!/bin/sh
 # M8 shim for the F50 vendor AT wrapper: the Agent calls
-#   mu300-at -t <seconds> -        (command arrives on stdin)
+#   mu300-at -t <seconds> [-s <slot>] -     (command arrives on stdin)
 # and expects the modem response lines, terminated by OK.
 # On this device the only safe AT owner is ModemManager, so every command is
 # relayed through mmcli instead of opening /dev/wwan0at0 behind its back.
+#
+# -s <slot> runs the command inside that SIM's AT context (AT+SPACTCARD) and
+# puts the modem back afterwards. Without it a hangup would reach whichever
+# card the modem happens to be bound to - the wrong line whenever the call
+# lives on the other SIM.
 timeout=5
+slot=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-t) timeout=$2; shift 2 ;;
+	-s) slot=$2; shift 2 ;;
 	--) shift; break ;;
 	-) shift; break ;;
 	*) shift ;;
@@ -20,14 +27,31 @@ AT*) ;;
 *) echo "ERROR"; exit 1 ;;
 esac
 
-OUT=$(mmcli -m any --timeout="$timeout" --command="$CMD" 2>&1)
-if [ $? -ne 0 ]; then
-	echo "ERROR"
-	exit 1
+# mmcli prints "response: 'line1\r\nline2'" and only an empty "'" for a command
+# that just answers OK. Relay the lines and never invent agreement: ERROR from
+# mmcli must stay ERROR.
+relay() {
+	OUT=$(mmcli -m any --timeout="$timeout" --command="$1" 2>&1)
+	case "$OUT" in
+	*"error:"*|*"ERROR"*) return 1 ;;
+	esac
+	printf '%s\n' "$OUT" | sed -n "s/^response: '\(.*\)'$/\1/p" | sed 's/\\r\\n/\n/g'
+	return 0
+}
+
+if [ -z "$slot" ]; then
+	relay "$CMD" || { echo "ERROR"; exit 1; }
+	echo "OK"
+	exit 0
 fi
-# mmcli prints: response: 'line1\r\nline2'
-printf '%s\n' "$OUT" | sed -n "s/^response: '\(.*\)'$/\1/p" | sed 's/\\r\\n/\n/g'
-case "$OUT" in
-*"error:"*|*"ERROR"*) echo "ERROR"; exit 1 ;;
+
+# A slot scope must never rewrite the slot machinery itself.
+case "$(printf '%s' "$CMD" | tr '[:lower:]' '[:upper:]')" in
+*+SPACTCARD*|*+SPSWDATA*) echo "ERROR"; exit 1 ;;
 esac
-echo "OK"
+
+# The slot prefix has to ride the same command as the work it scopes: MM
+# normalises its own context between separate mmcli calls, so "switch, then
+# send" silently lands on the primary card. The firmware adapter builds
+# "AT+SPACTCARD=<slot>;<cmd>" and sends it whole.
+exec env MU300_SIM_SLOT="$slot" /usr/libexec/unisoc-modem/at -t "$timeout" "$CMD"

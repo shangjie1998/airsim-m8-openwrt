@@ -83,6 +83,10 @@ func (d *daemon) callAction(w http.ResponseWriter, r *http.Request) {
 		Number      string `json:"number"`
 		CallID      string `json:"call_id"`
 		OperationID string `json:"operation_id"`
+		// Card is the page's dial-SIM choice; empty keeps the current data card.
+		// Without it both cards' AT context is the primary one and a call from
+		// the second SIM is impossible to request from the local page.
+		Card string `json:"card,omitempty"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	decoder.DisallowUnknownFields()
@@ -99,6 +103,14 @@ func (d *daemon) callAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		payload["number"], payload["operation_id"] = input.Number, "luci-"+input.OperationID
+		switch input.Card {
+		case "":
+		case "0", "1":
+			payload["sim_account"] = input.Card
+		default:
+			write(w, 200, map[string]any{"error": "不支持的 SIM 选择，只能是 0 或 1"})
+			return
+		}
 	case "answer", "hangup":
 		if !uiCallID.MatchString(input.CallID) {
 			write(w, 200, map[string]any{"error": "请先选择要操作的通话"})
