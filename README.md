@@ -1,191 +1,130 @@
-# AirSIM for MU300 — OpenWrt LuCI 通话网关插件
+# AirSIM for VIPME-M8 — 把通话网关装进 OpenWrt 手机
 
-> **本仓库包含一条独立的手机适配线：VIPME-M8 / UMS9620（OpenWrt 25.12.5，内核 6.18.54）。**
-> 安装包、逐功能说明、换机型的编译与微调指南见
-> **[README-M8.md](README-M8.md)** 与 **[docs/M8_BUILD_AND_ADAPT.md](docs/M8_BUILD_AND_ADAPT.md)**。
-> 下面这段是上游 U30 Air / F50 的原始说明，两者互不影响。
+把 AirSIM 的通话网关（配对、控制面、通话音频桥、短信）装进一台跑 OpenWrt 的中兴 / 紫光展锐
+UMS9620 安卓手机，让 iPhone 在同一局域网里用这台手机的 SIM 卡接打电话、收发短信。
 
-> **2026-11-05 R22：** 云端早期语音采用 v1 显式协商，并在双向音频握手前后复查真实通话状态。用户已反馈当前通话体验验收通过；R22 完整包和新协商路径尚未单独实机验证，见 [发布说明](docs/RELEASE_v0.1.0-r22.md)。
+**不是刷机包，不是 APK，不改内核。** 只在自己的命名空间里落地文件，一条命令可完整卸载。
 
-**R22 · U30 Air 云端早期语音协议对齐版。** 接入严格来电身份解析、通话历史确认及短信 SIM 字段，重复接听同一已接通/保持通话不再发送控制命令。保留 R20 配对修复及此前短信、电量、DSP 固件离线回退。音频保持现有 8 kHz 单声道 PCM，系统和内核保持不变；只修改设备端适配，不改 AirSIM 客户端。PR #29 新接口已通过自动化测试，尚未单独实机验收。
+| | |
+|---|---|
+| 本适配仓库 | <https://github.com/shangjie1998/airsim-m8-openwrt> |
+| 上游项目 | <https://github.com/kai-wu-cortex/airsim-mu300> |
+| 已验收版本 | **`0.1.0(1)-r22-m8`** |
+| 安装包 | [`dist/airsim-m8-0.1.0(1)-r22-m8.tar.gz`](dist/) · 5.7 MB |
+| 使用者手册 | [README-M8.md](README-M8.md) —— 机型全景、逐功能调用说明、换机型核对表 |
+| 编译与微调 | [docs/M8_BUILD_AND_ADAPT.md](docs/M8_BUILD_AND_ADAPT.md) —— 工具链、编译坑、改功能后的流程 |
+| 上游原说明 | [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) —— U30 Air / F50 的 R22 原文，保留备查 |
 
-- 电量：通过现有认证健康接口和云端心跳提供百分比、充电状态及采样时间。未知或过期样本不显示为有效电量；此前 R21 修复版已核对设备与云端读数一致，用户确认云端手机显示正常；充放电变化待验收，见 [电量说明](docs/AIRSIM_BATTERY.md)。
-- 通话：取消同号两分钟等待，按已认证身份与操作 ID 持久去重；保留原通话结束事件并通知客户端。立即重拨、接通后对端挂断仍待完整实机回归，见 [通话修复记录](docs/R18_REDIAL.md)。
-- 短信：接入客户端现有收件箱、确认与发送接口；真实收发和后台推送尚未验收，见 [短信说明](docs/AIRSIM_SMS.md)。
-- 云端号码：此前 R21 修复版发送当前 SIM 号码，号码不可用时清除旧值；已核对 Relay 号码与设备一致，用户确认手机显示正常，未改客户端，详见 [接入记录](docs/AIRSIM_BATTERY.md)。
-- 固件：缺失 DSP 固件时尝试固定上游，失败或哈希不符则用保存的固定副本回退，两条路径核对同一 SHA-256。已有固件保留，来源与许可边界见 [记录](docs/DSP_FIRMWARE_PROVENANCE.md)。
+---
 
-R22 云端接通前运营商语音要求客户端发送 `early_media_version: 1` 和完整通话身份；首帧前返回 `early_media_ready_v1`，接通前仅下行、不提前计时。未协商的旧客户端仍可正常接通后通话，但不会收到云端早期语音。请使用支持此协议的新版 AirSIM（171 已补充 R21 旧状态名兼容）。VoWLAN 协议不变。此前 R21 两种模式的提示音、计时与双向通话已通过用户验收，见 [记录](docs/EARLY_MEDIA.md)。
+## 1. 适配环境（全部为真机实测值）
 
-此前 R20 的配对修复候选已安装 U30 Air，用户确认 iPhone 保持云模式、连续两次使用新验证码配对成功；设备身份和原配对保留，云连接正常。R22 完整 APK 未单独完成实机升级回归，其他功能不因配对通过而视为已验收，见 [R22 发布说明](docs/RELEASE_v0.1.0-r22.md)。
+| 项目 | 实测值 |
+|---|---|
+| 机型 | **VIPME-M8**，`Spreadtrum UMS9620` SoC（与 MU300 / F50 同 SoC） |
+| 系统 | **OpenWrt 25.12.5 `r33051-f5dae5ece4`**，target `armsr/armv8`，arch `aarch64_generic`，包管理 `apk-tools 3.0.5` |
+| 系统主线 | [openwrt/openwrt](https://github.com/openwrt/openwrt)（`r33051` 为上游主线版本号；本机固件由移植者自建，刷机包为 `m8-openwrt-25.12.5-r20261106.183308`） |
+| 内核 | **`6.18.54-m8-probe12`**（自建 mainline 变体，非厂商 5.4） |
+| 声卡 | `card0 = sprdphone-sc2730` |
+| 通话采集 | `FE_ST_VOICE_C` = `hw:0,9`，8 kHz 单声道带 DMA |
+| 通话播放 | `FE_ST_VOICE_PCM_P` = `hw:0,18`，按 16 kHz 宽带消费 |
+| 调制解调器 | ModemManager，plugin `unisoc`，AT 端口 `wwan0at0`，IMEI `866766061031893` |
+| 根分区 | `/dev/mmcblk0p74`（`e5root`，ext4 4.0 GB），装机只写这一分区 |
+| 网络 | `br-lan 192.168.9.1/24` |
 
-> [!WARNING]
-> **R22 沿用 R17 的 U30 Air 一体安装方案，当前仅提供匹配 `5.4.254-gb50db5b6224c` 及指定内核配置的音频扩展。F50 / 7.2.8 尚未适配，不能仅凭“1031 之后”判断兼容。**
-> 安装器会检查音频扩展匹配条件。R17 实机升级、重启自动续接及重启后两通双向通话已通过验收；R19 新增功能尚未完成整体验收；本次早期媒体已有 VoWLAN 与云端提示音、计时和接通后双向声音的用户确认。
+**安全边界（硬约束）**：不刷机，不写 boot / bootloader / 分区表 / modem NV，不改内核，不覆盖厂商脚本
+（厂商 `/usr/libexec/rpcd/mu300dash` 装/卸前后 md5 必须一致）。
 
-将运行 mu300-linux OpenWrt 的 U30 Air 接入 AirSIM。它是 LuCI 插件、Linux Agent 和音频桥，不是 Android APK 或完整系统镜像。
+## 2. 相对上游改了什么
 
-[下载 Release](https://github.com/kai-wu-cortex/airsim-mu300/releases) · [一体部署手册](docs/DEPLOYMENT.md) · [R22 说明](docs/RELEASE_v0.1.0-r22.md) · [硬件适配指南](HARDWARE_ADAPTATION.md)
+上游代码（daemon、Agent、LuCI、AirSIM 协议）一行没重写，改的都是"另一种内核、另一种音频路由"下的设备侧差异：
 
-**R22 把插件、已重建音频模块、工具和准备流程合并到一个签名 APK。** 首次缺少 DSP 固件时，从上游固定地址下载并校验，失败时使用包内固定备用副本；已有文件保留。首次需要重启时，明确提示重启进入 OpenWrt 一次，随后自动继续准备。无需用户单独下载音频扩展或运行恢复命令。系统镜像、内核、客户端与配对配置保持原样。
+| # | 差异 | 位置 |
+|---|---|---|
+| 1 | 播放采样率按 **16 kHz + 20 ms 周期**下发，走 `Upsampler` 而不是 8 kHz 直通（否则对端听到"2 倍速、变身"） | `internal/audio/devices.go`、`session.go` |
+| 2 | 本机号码补 **`+`** 成 E.164（`86…` → `+86…`） | `patches/AirSIM-e164.patch` |
+| 3 | 对外显示名 **VIPME-M8**（health / mDNS / 云端注册 / LuCI），内部标识 `mu300` 一律保留 | `gateway.go`、`main.go`、`build/luci/` |
+| 4 | 发送短信写入 **发件池 + 时间戳**，同步器与 LuCI 列表识别 `dir: mo` | `build/mu300-sms`、`sms-pool-sync.py`、`sms-dash.py` |
+| 5 | 挂断/接听的完整性校验改成"刷新即通过"，不再被 grace 缓存卡死 | `patches/AirSIM-m8-sms-callfix.patch` |
+| 6 | LuCI 复用**上游原生页面**（`airsim` / `airsim-sms` 两个 ubus 对象 + 菜单 + ACL），未自建页面 | `m8-pkg/luci/` |
 
-已有 R16 恢复扩展会在内容匹配后复用；不覆盖未知扩展或自定义准备脚本。R15 已撤回。**历史版本线：R16 面向 1031 之后的系统，R12 面向 1031 之前的系统。** 日期标签不能替代硬件、内核配置与音频 ABI 检查，也不代表所有新版系统均可通话。
+每处"调用系统哪里"（哪个 ALSA 设备、哪个 mmcli 命令、哪个 rpcd 对象、哪个 procd 实例）在
+[README-M8.md 第 3 节](README-M8.md#3-每个功能调用了系统的哪里) 逐条写死。
 
-## 功能
+## 3. 直接安装
 
-- 对齐 AirSIM PR #29：严格校验推送 call_id / call_uuid / generation，开放认证历史确认，传递短信槽标签并验证显式选卡。新增能力尚未实机验收，详见 [接口兼容记录](docs/PR29_AGENT_COMPATIBILITY.md)。
-- 联合升级顺序：兼容设备端 Agent → 支持短信字段的 Worker → 新版 iOS。旧 Worker 可能忽略选卡，不能仅凭本插件升级宣称云端选卡可用。
-
-- 修复新版 AirSIM 云模式配对兼容性；配对成功与云推送就绪分开判断，失败注册不新增局域网密钥，详见 [修复记录](docs/PAIRING_COMPATIBILITY_FIX.md)。
-
-- LuCI 展示服务、SIM 本机号码、网络、通话和音频状态。
-- 启动/关闭服务并显示确认结果；获取六位配对码时开启 120 秒 Bonjour 发现。
-- 复用 AirSIM 配对与 VoWLAN 协议，提供经过身份验证的局域网通话网关。
-- 通过 MU300 SIM 拨号、选择具体来电接听、选择具体通话挂断。
-- 将硬件通话音频转换为 AirSIM PCM，兼容现有云端 Relay 媒体链路。
-- 在状态卡下方查看短信、未读数量、全文及发送短信，发送前二次确认。
-- 一体安装先校验随包音频的内核与配置，保留架构、签名及通话/媒体/短信空闲检查。
-- 固定上游 Agent 提交，在隔离副本应用 MU300 补丁，**不修改 AirSIM iOS / Android 项目**。
-- 局域网／云端策略、Relay 地址限制、LAN 接口与配对/控制/PCM 端口设置。
-- 脱敏状态报告下载、离线版本说明、手动检查项目 Release（不自动安装）。
-- 后台自动检查、检查开关与预览频道、用户确认后升级、下载/签名校验/安装进度及失败提示；不自动安装或降级。
-
-### 当前边界
-
-| 功能 | 状态与限制 |
-| --- | --- |
-| LuCI 通话控制 | 网页不提供麦克风/扬声器，不自动建立客户端媒体会话 |
-| SIM 本机号码 | 从 SIM / 基带读取；未存储时显示未提供，不推测号码 |
-| 通话身份 | UUID 与操作回执；基带快照短暂缺失下的 ID 连续性仍需实机回归，多路验收未完成 |
-| 呼叫等待 | 定向接听/挂断与保持策略；不是会议通话或完整多路切换 UI |
-| PCM | 单媒体会话；当前网络音频为 8 kHz、单声道、S16LE |
-| 短信 | R17 仅 LuCI；R19 包含 AirSIM 同步与发送，待实机验收。每条最多 70 字，不支持 emoji 或长短信拆分 |
-| 远程访问 | 需要兼容 AirSIM 客户端/Relay；不应把 LuCI、SSH 或裸 PCM 暴露到公网 |
-
-## 支持环境
-
-| 项目 | 当前已验证基础环境 |
-| --- | --- |
-| 设备 | U30 Air，F50 尚未验收 |
-| 系统 | mu300-linux v2026.10.30.1 / OpenWrt 25.12.6 |
-| 内核 | `5.4.254-gb50db5b6224c` |
-| 内核配置 SHA-256 | `1057cb97e0d2d7f26816e8bf7841faac1153833a01d4893cdc196b75ae6356b3` |
-| 软件包 | aarch64_generic，APK v3，非 Android APK |
-| 音频 | 随包附带 24 个重建模块；设备已有固件、固定上游下载或包内固定备用副本 |
-
-R16 的音频实现已由用户确认短时局域网双向声音清晰、卡顿消失或明显改善。R17 复用该实现，增加一体安装流程；重启后两通测试均由用户确认双向清晰、无卡顿，挂断后资源正常释放。实际驱动兼容性不能只看系统日期或内核大版本；7.2.8、其他内核配置与其他硬件不在当前一体包验收范围。
-
-## 快速安装
-
-以下命令安装 R22 正式版。安装前阅读适用范围和未验收项，并保存原版包以便回退。
-
-先结束全部电话与短信任务，并确认设备符合上表。在设备 SSH 终端执行：
+前置：root、`/proc/asound/pcm` 里同时有 `FE_ST_VOICE_C` 与 `FE_ST_VOICE_PCM_P`、有 `mmcli`、`/opt` 剩余 > 20 MB、
+没有手工残留的 `airsim-mu300d` / `airsim-agent`。安装器会逐项检查，任一不满足直接退出。
 
 ```sh
-cd /tmp
-wget -O airsim-install.sh https://github.com/kai-wu-cortex/airsim-mu300/releases/download/v0.1.0-r22/install.sh
-cat airsim-install.sh
-sh airsim-install.sh --check
-sh airsim-install.sh --install
+# 主机侧：下载并传到设备（设备侧直接写系统路径会失败，必须先落 /tmp）
+curl -LO "https://github.com/shangjie1998/airsim-m8-openwrt/raw/main/dist/airsim-m8-0.1.0(1)-r22-m8.tar.gz"
+scp "airsim-m8-0.1.0(1)-r22-m8.tar.gz" root@192.168.9.1:/tmp/
+
+# 设备侧：解包安装
+ssh root@192.168.9.1
+mkdir -p /tmp/m8pkg && cd /tmp/m8pkg
+tar xzf "/tmp/airsim-m8-0.1.0(1)-r22-m8.tar.gz" -C /tmp/m8pkg
+sh install.sh
 ```
 
-也可按 [部署手册](docs/DEPLOYMENT.md) 在 LuCI 上传同版签名 APK。不使用忽略签名或强制依赖选项。
+装完脚本打印三项：procd 服务 `running`、daemon `/status` 的 `audio_available`、Agent `/api/health`。
+随后在 LuCI → 服务 → AirSIM 里取配对码，用 iPhone 的 AirSIM 配对。
 
-- 显示“准备完成”：刷新 LuCI → 服务 → AirSIM，启动服务、获取配对码并连接客户端。
-- 显示“需重启完成安装”：安排一次 **进入 OpenWrt 的重启**，安装会自动继续，无需补装音频包。部分设备默认进入 Android，须使用设备已有的 Linux 启动入口。
-- 显示“准备未完成”：不能将软件包存在视为可通话；查看安装错误，不能绕过内核/配置检查。
-
-开发签名公钥 SHA-256：`0ce703e76ea4b702194c54b90534d7127874bb38ecda17f7ed6b1add2d2cf1de`。
-
-没有自动拨号、接听、短信发送或录音。配对后由用户手动确认双向声音。长通话、多路与公网 Relay 异常恢复尚未完整验收。
-
-### 回退与卸载
-
-先结束通话并保存可信旧包与配置。插件卸载停止服务，保留配对数据和音频恢复备份；已驻留音频模块需重启才会退出。音频扩展回退另按 [音频指南](packaging/openwrt-audio/README.md)，不以跨版本强装方式回退。
-
-## 工作原理
-
-```text
-AirSIM 客户端 ── 加密配对 / 签名 VoWLAN ── MU300 网关
-                                               ├─ Agent → mu300-atd → 基带 / SIM
-                                               └─ PCM 桥 → mu300-audio → ALSA / DSP
-LuCI ── 登录会话 + rpcd ACL ── 服务控制 / 配对 / 通话 / 原生短信服务
-```
-
-`mu300-atd` 独占 AT 串口；插件不抢占串口、不套用其他设备的 USB 恢复/刷写逻辑。信令、媒体和发现服务分层，“AT 能拨号”不代表“有双向声音”。
-
-| 接口 | 默认地址 | 用途 |
-| --- | --- | --- |
-| Agent | `127.0.0.1:8575` | 内部状态和控制 |
-| PCM 桥 | `127.0.0.1:7580` | 内部音频，不直接向 LAN 开放 |
-| 管理后端 | `127.0.0.1:7581` | LuCI / rpcd 操作 |
-| 配对 | LAN `8580` | 限时 Bonjour 配对窗口 |
-| VoWLAN | LAN `8581` / `8582` | 签名控制 / 认证 PCM |
-
-配对加密与请求认证不意味着全部媒体使用 TLS 加密；当前局域网 PCM 会话认证后传输原始音频。仅在可信 LAN 使用，跨不可信网络需安全隧道或经审查的传输设计。
-
-## 源码与构建
-
-需要 Git、Go 1.24+、Node.js（测试）、Docker、curl、OpenSSL。
+卸载：
 
 ```sh
-git clone https://github.com/kai-wu-cortex/airsim-mu300.git
-git clone https://github.com/kai-wu-cortex/AirSIM.git
-cd airsim-mu300
-go test -race ./...
-go vet ./...
-node --test scripts/overview.test.mjs scripts/sms.test.mjs scripts/install.test.mjs scripts/manage.test.mjs
-AGENT_TREE=$(sh scripts/prepare-agent.sh)
-(cd "$AGENT_TREE/module/module-agent" && go test -race ./... && go vet ./...)
-docker pull node:22-alpine
-sh scripts/package-apk.sh
+sh /opt/airsim-m8/uninstall.sh
 ```
 
-Agent 固定到 [`cc2ade3124ac34bec7d8c441f4b66a57a6dfec62`](https://github.com/kai-wu-cortex/AirSIM/commit/cc2ade3124ac34bec7d8c441f4b66a57a6dfec62)，见 `patches/AIRSIM_BASE`。构建器只读提交，将补丁应用到 `out/` 隔离副本，不修改相邻主项目。
+停服务 → 取消自启 → 两个 DSP 开关打回 `off` → 删三个 shim、软链、`/etc/mu300`、`/opt/airsim-m8` → 重启 rpcd。
+厂商 `e5-voice-native` 与 `mu300dash` 一个字节不碰。
 
-`AIRSIM_UPSTREAM_REPO` 指定只读上游 Git 仓库；`AIRSIM_PACKAGE_KEY` 指定签名私钥。默认密钥仅存在本机 `out/signing/`。**自行构建的公钥与本 Release 不同，不要沿用发布安装脚本的固定公钥指纹。**
+## 4. 已知限制
 
-```text
-HARDWARE_ADAPTATION.md   给 AI Agent / 开发者的跨硬件通话适配指南
-cmd/airsim-mu300d/       管理服务、配对入口、设备集成
-internal/audio/         PCM 协议、重采样、ALSA 会话生命周期
-internal/gateway/       VoWLAN 签名、路由和媒体网关
-internal/pairing/       加密配对会话
-patches/                固定上游版本及 MU300 专用 Agent 补丁
-packaging/openwrt/      LuCI、rpcd ACL、procd、APK 钩子
-scripts/                构建、安装、测试与发布辅助
-docs/                   实施证据、验收边界与历史设计
-```
+| 现象 | 说明 |
+|---|---|
+| 通话约 50 秒后断链 | `aplay` 报 `pcm_write I/O error`，上下行帧计数冻结，DSP 开关自动回落；未解 |
+| 屏幕接听来电采不到下行 | 原生拨号器接听态独占采集路由（`arecord` 直接 I/O error）；改用 iOS 端接听即可 |
+| 偶尔闪白屏 | 面板 ESD 看门狗循环复位（`esd check failed` + `esd recovery end`），内核侧无软件开关，与安装包无关 |
+| iOS 已配对设备仍显示旧名 | 设备名缓存在 App 本地，改名后需删设备重新配对 |
+| `cellular_registration` 显示"未注册" | 状态字段口径问题，ModemManager 实际报 connected，不影响通话 |
 
-## 排障与安全
+## 5. 版本口径
 
-- 启动失败：核对 LuCI 音频准备状态、必需工具、DSP 固件，以及是否有其他进程占用语音场景。R22 随包音频模块要求精确匹配内核与配置；不绕过驱动 ABI 检查。
-- 能拨号但无声音：分别检查基带状态、客户端路由、PCM 握手、采集/播放帧数，不能只看注册状态或声卡。
-- 号码未提供：SIM 可能未存储本机号码，不能用来电号码、IMSI 或测试号码替代。
-- 短信接口缺失：需要固件 `mu300dash` 短信服务，不回退到冲突的 AT 编码流程。
-- 请自行设置 LuCI 管理密码；脚本不修改凭据。勿开放 WAN 管理。
-- 提交日志时去除号码、IMSI/IMEI、短信正文、配对码、密钥和音频。
+`0.1.0(N)-r22-m8`：`0.1.0`、`r22` 与上游版本号对齐，`(N)` 为本次适配的打包序号，每改动打包一次 +1，
+`m8` 是机型标识。`scripts/bump-version.sh` 负责 +1 并同步两处 `VERSION`。
 
-详见 [实施记录](docs/MU300_PLUGIN_IMPLEMENTATION.md) 和 [呼叫等待说明](docs/MU300_R9_CALL_WAITING.md)。U30 Air 整体设计与 UFI Tools 文档属于历史探索，不代表当前已发布功能。
+## 6. 想让 AI 帮你装到别的手机
 
-## 上游、Fork / 镜像关系与致谢
+把仓库链接交给 AI，让它按顺序读：
 
-本仓库是**独立集成与适配工程**，不是 mu300-linux 或 mu300-audio 的官方发布，也不是它们的 GitHub Fork。
+1. [docs/M8_BUILD_AND_ADAPT.md](docs/M8_BUILD_AND_ADAPT.md) —— 先跑通编译（Go 1.24.7 + 阿里云镜像），再改参数
+2. [README-M8.md 第 6 节](README-M8.md) —— 10 项核对表：声卡名、采集/播放 FE、采样率、ModemManager 端口、分区、网络
+3. 改 `internal/audio/devices.go` 的设备参数与 `VERSION`，`bump-version.sh` 升号，重打 tar，`scp` 到 `/tmp` 再装
 
-| 项目 | 如何使用 | 作者与来源 |
-| --- | --- | --- |
-| [AirSIM](https://github.com/kai-wu-cortex/AirSIM) | 固定 Agent 基线、配对/VoWLAN/Relay 协议；设备专用补丁 | AirSIM contributors |
-| [mu300-linux](https://github.com/dikeckaan/mu300-linux) | Linux/OpenWrt、AT 服务、原生短信与设备基础设施 | **dikeckaan** 及贡献者 |
-| [mu300-audio 原项目](https://github.com/dikeckaan/mu300-audio) | 音频驱动、DSP 场景与工具，固定 `v1.0.5` | **dikeckaan** 及贡献者 |
-| [mu300-audio 源码镜像](https://github.com/kai-wu-cortex/mu300-audio) | 原仓库不可访问时保存源码与标签 | 不改变原作者署名；当前 GitHub 元数据不是 Fork 关系 |
-| [OpenWrt / LuCI](https://openwrt.org/) 与 [ALSA](https://www.alsa-project.org/) | 管理界面、包管理与音频工具 | 各上游贡献者 |
+不要做的六件事（写进文档、也在文档里逐条解释）：不刷机、不动分区表、不改 modem NV、不覆盖厂商同名脚本、
+不装别内核编的音频模块、不远程 `reboot`。
 
-感谢 **dikeckaan** 在 MU300 Linux 与通话音频栈上的工作，也感谢音频上游注明的 **kano / kanoqwq、Enceka、e5-linux** 及 Unisoc 驱动贡献者。上游引用不代表作者对本插件的背书或支持承诺。
+## 7. 上游与致谢
 
-2026-10-31 发布准备时，原 mu300-audio URL 返回 404；镜像仍可访问。Release 保留固定版本音频依赖、源码与校验信息，不把镜像描述为官方新版本。
+本仓库是**独立适配工程**，不是 [kai-wu-cortex/airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300) 的官方发布。
 
-## 许可证
+| 项目 | 用途 | 作者 |
+|---|---|---|
+| [AirSIM](https://github.com/kai-wu-cortex/AirSIM) | 配对 / VoWLAN / Relay 协议、Agent 基线 | AirSIM contributors |
+| [airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300) | daemon、Agent、LuCI、音频桥与打包流程，本适配的直接上游 | **kai-wu-cortex** |
+| [mu300-linux](https://github.com/dikeckaan/mu300-linux) | OpenWrt 侧 AT 服务、原生短信与设备基础设施 | **dikeckaan** 及贡献者 |
+| [mu300-audio](https://github.com/dikeckaan/mu300-audio) | 音频驱动、DSP 场景与工具 | **dikeckaan** 及贡献者 |
+| [OpenWrt / LuCI](https://openwrt.org/) · [ALSA](https://www.alsa-project.org/) | 管理界面、包管理、音频工具 | 各上游贡献者 |
 
-本项目自身代码沿用非商业定位，见 [LICENSE](LICENSE)、[NOTICE](NOTICE)。AirSIM Agent 使用 **PolyForm Noncommercial 1.0.0**；mu300-audio 按文件采用 **GPL-2.0 / MIT**；ALSA 按组件采用 **LGPL-2.1-or-later / GPL-2.0-or-later**。各组件保留各自权利，不以单一许可证覆盖整包。
+感谢 **kai-wu-cortex** 把 AirSIM 的 MU300 侧完整开源——本适配的 daemon、Agent、LuCI 页面和协议实现全部来自它；
+感谢 **dikeckaan** 在 MU300 Linux 与通话音频栈上的工作，以及音频上游注明的 **kano / kanoqwq、Enceka、e5-linux**
+与 Unisoc 驱动贡献者。上游引用不代表作者对本适配的背书。
 
-这是 **source-available（源码可用）非商业项目**，不能把整包称为无商业限制的开源软件。商业使用需分别取得相关许可。独立 DSP 固件的许可未明确，项目许可证不覆盖它，见 [固件来源记录](docs/DSP_FIRMWARE_PROVENANCE.md)。依赖与对应源码说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [SOURCES.md](SOURCES.md)。
+## 8. 许可证
+
+本适配沿用上游非商业定位，见 [LICENSE](LICENSE)、[NOTICE](NOTICE)。
+AirSIM Agent 为 **PolyForm Noncommercial 1.0.0**；mu300-audio 按文件采用 **GPL-2.0 / MIT**；
+ALSA 按组件采用 **LGPL-2.1-or-later / GPL-2.0-or-later**。各组件保留各自权利，
+整包不能称为无商业限制的开源软件。依赖与源码说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[SOURCES.md](SOURCES.md)。
