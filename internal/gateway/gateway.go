@@ -211,7 +211,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/health" {
 		w.Header().Set("Content-Type", "application/json")
 		capable, number, battery := g.agentIdentity(r.Context())
-		health := map[string]any{"ok": true, "version": 1, "transport": "vowlan", "agent_id": g.id, "identity_proof": Sign(key, "AIRSIM-HEALTH1\n"+nonce+"\n"+g.id), "canonical_call_ids": capable, "phone_number": number, "agent_kind": "mu300", "device_name": "AirSIM MU300", "manufacturer": "ZTE", "model": "MU300"}
+		health := map[string]any{"ok": true, "version": 1, "transport": "vowlan", "agent_id": g.id, "identity_proof": Sign(key, "AIRSIM-HEALTH1\n"+nonce+"\n"+g.id), "canonical_call_ids": capable, "phone_number": number, "agent_kind": "mu300", "device_name": "AirSIM VIPME-M8", "manufacturer": "ZTE", "model": "VIPME-M8"}
 		if battery != nil {
 			health["battery"] = battery
 		}

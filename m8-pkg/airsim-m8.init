@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+# AirSIM bubble for VIPME-M8 (ZTE / Unisoc UMS9620, mainline 6.18 kernel).
+# Pure userspace: the modem stack, the native e5 voice service, the kernel and
+# the partition table are never touched by this service.
+START=95
+STOP=10
+USE_PROCD=1
+
+AGENT_ENV="AIRSIM_RUNTIME_PROFILE=mu300-openwrt AIRSIM_VOICE_BACKEND=mu300 AIRSIM_MU300_MODE=cloud AIRSIM_MU300_PCM_ADDRESS=127.0.0.1:7580"
+
+start_service() {
+	procd_open_instance daemon
+	procd_set_param command /opt/airsim-m8/bin/airsim-mu300d -data /opt/airsim-m8/data
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file /opt/airsim-m8/data/management.json
+	procd_close_instance
+
+	# The Agent runs as its own instance: the daemon supervises exactly one child
+	# on /usr/lib/airsim/airsim-agent (a symlink into /opt), never two at once.
+	procd_open_instance agent
+	procd_set_param command /opt/airsim-m8/bin/airsim-mu300d -run-agent -data /opt/airsim-m8/data
+	procd_set_param env $AGENT_ENV
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	# ModemManager owns the AT port on this device, so the SMS pool the Agent
+	# expects is mirrored from ModemManager instead of a vendor SMS daemon.
+	procd_open_instance smspool
+	procd_set_param command /usr/bin/python3 /opt/airsim-m8/bin/sms-pool-sync.py
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	# Make sure the DSP voice routes never outlive the service: a forgotten
+	# switch leaves an extra route in the mixer until the next reboot.
+	amixer -q -c 0 cset "name=S_VOICE_CAP_C SWITCH" off 2>/dev/null
+	amixer -q -c 0 cset "name=S_VOICE_PCM_P SWITCH" off 2>/dev/null
+	return 0
+}

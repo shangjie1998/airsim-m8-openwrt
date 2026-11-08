@@ -236,7 +236,7 @@ func flagValue(v any) bool        { b, _ := v.(bool); return b }
 func diagnosticReport(s map[string]any, settings managementSettings) map[string]any {
 	a, relay, sim, calls, audio := object(s["agent"]), object(s["relay"]), object(s["sim"]), object(s["calls"]), object(s["audio"])
 	return map[string]any{
-		"schema": 1, "product": "AirSIM for MU300", "version": version, "generated_at": time.Now().UTC().Format(time.RFC3339),
+		"schema": 1, "product": "AirSIM for VIPME-M8", "version": version, "generated_at": time.Now().UTC().Format(time.RFC3339),
 		"mode": settings.Mode, "status_available": s != nil, "agent_reachable": flagValue(a["reachable"]),
 		"sim_inserted": flagValue(sim["sim_inserted"]), "audio_available": flagValue(s["audio_available"]), "audio_active": flagValue(audio["active"]),
 		"call_status_available": flagValue(calls["available"]), "call_active_or_unknown": s == nil || flagValue(s["call_active"]),
@@ -331,7 +331,7 @@ func checkUpdates(ctx context.Context, previews bool) (map[string]any, error) {
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", releasesAPI, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "AirSIM-MU300-update-check")
+	req.Header.Set("User-Agent", "AirSIM-VIPME-M8-update-check")
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, e := client.Do(req)
 	if e != nil {

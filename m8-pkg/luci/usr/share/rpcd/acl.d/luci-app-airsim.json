@@ -1,0 +1,37 @@
+{
+ "luci-app-airsim": {
+  "description": "Manage AirSIM for VIPME-M8",
+  "read": {
+   "ubus": {
+    "airsim": [
+     "status",
+     "settings_get",
+     "diagnostics",
+     "updates_status"
+    ]
+   }
+  },
+  "write": {
+   "ubus": {
+    "airsim": [
+     "settings_save",
+     "updates",
+     "updates_policy",
+     "update_install",
+     "pair_start",
+     "pair_cancel",
+     "number_refresh",
+     "start",
+     "stop",
+     "call_action"
+    ],
+    "airsim-sms": [
+     "sms_list",
+     "sms_show",
+     "sms_send",
+     "sms_job"
+    ]
+   }
+  }
+ }
+}

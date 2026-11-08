@@ -1,0 +1,36 @@
+diff --git a/module/module-agent/sms.go b/module/module-agent/sms.go
+index cfba6f1..ede7ad9 100644
+--- a/module/module-agent/sms.go
++++ b/module/module-agent/sms.go
+@@ -635,8 +635,30 @@ func parseCNUM(response string) string {
+ 		}
+ 		fields := splitCSV(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "+CNUM:")))
+ 		if len(fields) >= 2 {
+-			return decodeMaybeUCS2(fields[1])
++			return normalizeSelfNumber(decodeMaybeUCS2(fields[1]))
+ 		}
+ 	}
+ 	return ""
+ }
++
++// normalizeSelfNumber renders the SIM's own number in E.164 so clients can
++// display and dial it without guessing the country code. Some SIMs store the
++// number as "8613..." with no leading "+", which made the app show a bare
++// country-code prefix instead of a dialable number.
++func normalizeSelfNumber(raw string) string {
++	n := strings.TrimSpace(raw)
++	if n == "" {
++		return ""
++	}
++	if strings.HasPrefix(n, "+") {
++		return n
++	}
++	if strings.HasPrefix(n, "00") {
++		return "+" + strings.TrimPrefix(n, "00")
++	}
++	// China: 86 + 11-digit mobile subscriber number.
++	if len(n) == 13 && strings.HasPrefix(n, "86") {
++		return "+" + n
++	}
++	return n
++}

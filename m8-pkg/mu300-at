@@ -1,0 +1,33 @@
+#!/bin/sh
+# M8 shim for the F50 vendor AT wrapper: the Agent calls
+#   mu300-at -t <seconds> -        (command arrives on stdin)
+# and expects the modem response lines, terminated by OK.
+# On this device the only safe AT owner is ModemManager, so every command is
+# relayed through mmcli instead of opening /dev/wwan0at0 behind its back.
+timeout=5
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-t) timeout=$2; shift 2 ;;
+	--) shift; break ;;
+	-) shift; break ;;
+	*) shift ;;
+	esac
+done
+CMD=$(cat | tr -d '\r' | head -n 1)
+[ -n "$CMD" ] || { echo "ERROR"; exit 1; }
+case "$CMD" in
+AT*) ;;
+*) echo "ERROR"; exit 1 ;;
+esac
+
+OUT=$(mmcli -m any --timeout="$timeout" --command="$CMD" 2>&1)
+if [ $? -ne 0 ]; then
+	echo "ERROR"
+	exit 1
+fi
+# mmcli prints: response: 'line1\r\nline2'
+printf '%s\n' "$OUT" | sed -n "s/^response: '\(.*\)'$/\1/p" | sed 's/\\r\\n/\n/g'
+case "$OUT" in
+*"error:"*|*"ERROR"*) echo "ERROR"; exit 1 ;;
+esac
+echo "OK"

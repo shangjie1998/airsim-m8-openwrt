@@ -1,5 +1,7 @@
 /out/
 /dist/
+# The prebuilt M8 bundle is a deliverable: fetchable straight from the repo.
+!/dist/airsim-m8-*.tar.gz
 /sdk/
 .DS_Store
 /backups/

@@ -1,0 +1,18 @@
+#!/bin/sh
+# airsim-sms: SMS backend for the Upstream AirSIM LuCI panel.
+# On MU300 firmware the panel expects the vendor `mu300dash` object; the VIPME-M8
+# ships its own vendor `mu300dash` (sysinfo/sim_*), so this object is deliberately
+# named `airsim-sms` and the panel is patched to call it. Never touch the vendor file.
+case "$1" in
+	list)
+		cat <<'JSON'
+{"sms_list":{"page":"string"},"sms_show":{"id":"string"},"sms_send":{"num":"string","text":"string"},"sms_job":{}}
+JSON
+		;;
+	call)
+		exec /usr/bin/python3 /opt/airsim-m8/bin/sms-dash.py "$2"
+		;;
+	*)
+		exit 1
+		;;
+esac

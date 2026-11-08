@@ -1,0 +1,39 @@
+#!/bin/sh
+# M8 shim for the F50 SMS helper. The Agent feeds "phone\ntext" on stdin and
+# expects exactly "sent (reference N)" so it can record the submission.
+# Delivery goes through ModemManager's messaging API, which owns the AT port.
+IN=$(cat)
+PHONE=$(printf '%s' "$IN" | head -n 1 | tr -d '\r')
+TEXT=$(printf '%s' "$IN" | tail -n +2 | tr -d '\r')
+[ -n "$PHONE" ] || { echo "missing number"; exit 1; }
+[ -n "$TEXT" ] || { echo "missing text"; exit 1; }
+# mmcli's property parser splits on commas and ends a value at whitespace, so the
+# body must be single-quoted; a literal quote or newline cannot be represented.
+TEXT=$(printf '%s' "$TEXT" | tr -d "'" | tr '\n' ' ')
+
+# Single-quoted text keeps spaces and full-width punctuation inside the value.
+OUT=$(mmcli -m any --messaging-create-sms="number=$PHONE,text='$TEXT'" 2>&1)
+SID=$(printf '%s' "$OUT" | grep -o 'SMS/[0-9]*' | head -n 1)
+[ -n "$SID" ] || { printf '%s\n' "$OUT" | sed 's/.*error: //' | head -n 1; exit 1; }
+OUT=$(mmcli -s "/org/freedesktop/ModemManager1/$SID" --send 2>&1)
+case "$OUT" in
+*error*|*failed*|*Error*) printf '%s\n' "$OUT" | head -n 1; exit 1 ;;
+esac
+REF=$(printf '%s' "$SID" | grep -o '[0-9]*$')
+echo "sent (reference $REF)"
+
+# Record the submission in the native-style pool with an explicit timestamp so
+# LuCI and any pool reader can show when it was sent. The Agent deliberately
+# skips "dir: mo" entries, so this never duplicates into the inbound inbox.
+POOL=/etc/mu300/sms-pool/msg
+if [ -d "$POOL" ]; then
+    NOW=$(date +%s)
+    STAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
+    LEN=$(printf '%s\n' "$TEXT" | wc -c | tr -d ' ')
+    TMP="$POOL/.$NOW.$$"
+    {
+        printf 'dir: mo\nid: %s\nto: %s\nlength: %s\nreceived: %s\nscts: %s\n\n%s\n' \
+            "$NOW" "$PHONE" "$LEN" "$NOW" "$STAMP" "$TEXT"
+    } > "$TMP" 2>/dev/null && chmod 600 "$TMP" && mv "$TMP" "$POOL/$NOW" 2>/dev/null
+    rm -f "$TMP" 2>/dev/null
+fi

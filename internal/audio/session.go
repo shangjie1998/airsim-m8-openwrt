@@ -2,6 +2,7 @@ package audio
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -65,43 +66,75 @@ func run(ctx context.Context, name string, args ...string) error {
 func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest bool) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	if err := CheckTools(); err != nil {
-		return err
-	}
 	devices, err := Discover()
 	if err != nil {
 		return err
 	}
-	probe, pCancel := context.WithTimeout(ctx, 5*time.Second)
-	out, err := exec.CommandContext(probe, "/usr/bin/mu300-at", "-t", "3", "AT+CLCC").Output()
-	pCancel()
-	if err != nil || !strings.Contains(string(out), "OK") {
-		return errors.New("cellular call status unavailable")
+	if devices.CallProbe == probeMM {
+		if err = CheckMMTools(); err != nil {
+			return err
+		}
+	} else if err = CheckTools(); err != nil {
+		return err
 	}
-	if selfTest && strings.Contains(string(out), "+CLCC:") {
+	calling, err := probeCall(ctx, devices)
+	if err != nil {
+		return err
+	}
+	if selfTest && calling {
 		return errors.New("finish current call before audio self-test")
 	}
-	if !selfTest && !strings.Contains(string(out), "+CLCC:") {
+	if !selfTest && !calling {
 		return errors.New("no cellular call for PCM session")
 	}
-	if err = run(ctx, "/usr/bin/mu300-voice", "audio", "start", "dsp"); err != nil {
-		return err
-	}
-	defer func() {
-		clean, done := context.WithTimeout(context.Background(), 15*time.Second)
-		defer done()
-		_ = run(clean, "/usr/bin/mu300-voice", "audio", "stop")
-	}()
-	// Hold the AGDSP domain until *both* AP streams have fully closed. The
-	// upstream watch service must be stopped by the plugin while we own audio.
 	card := strconv.Itoa(devices.Card)
-	if err = run(ctx, "amixer", "-q", "-c", card, "cset", "name=agdsp_access_en", "1"); err != nil {
-		return err
+	if devices.NeedsVoiceScene {
+		// M8: two-stage scene bring-up. Only the playback route is armed before
+		// aplay opens; the capture switch is flipped once playback is running.
+		// Arming both up front makes the playback FE die with EIO about a second
+		// later, and both switches default to off, so both are always cleared.
+		if err = voiceSwitch(ctx, card, voicePlaybackCtl, true); err != nil {
+			return err
+		}
+		defer func() {
+			clean, done := context.WithTimeout(context.Background(), 15*time.Second)
+			defer done()
+			_ = voiceSwitch(clean, card, voiceCaptureCtl, false)
+			_ = voiceSwitch(clean, card, voicePlaybackCtl, false)
+		}()
+		// The DSP needs a moment between the mixer write and the first open.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(700 * time.Millisecond):
+		}
+	} else {
+		if err = run(ctx, "/usr/bin/mu300-voice", "audio", "start", "dsp"); err != nil {
+			return err
+		}
+		defer func() {
+			clean, done := context.WithTimeout(context.Background(), 15*time.Second)
+			defer done()
+			_ = run(clean, "/usr/bin/mu300-voice", "audio", "stop")
+		}()
+		// Hold the AGDSP domain until *both* AP streams have fully closed. The
+		// upstream watch service must be stopped by the plugin while we own audio.
+		if err = run(ctx, "amixer", "-q", "-c", card, "cset", "name=agdsp_access_en", "1"); err != nil {
+			return err
+		}
 	}
 	// The vendor 5.4 DMA driver cannot safely resubmit the same descriptor after
 	// an xrun. Exit and close the stream instead of ALSA's PREPARE/START recovery.
-	capture := exec.CommandContext(ctx, "arecord", "--fatal-errors", "-q", "-D", devices.Capture, "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2", "--period-size=960", "--buffer-size=5760")
-	play := exec.CommandContext(ctx, "aplay", "--fatal-errors", "-q", "-D", devices.Playback, "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1", "--period-size=320", "--buffer-size=1920")
+	capture := exec.CommandContext(ctx, "arecord", "--fatal-errors", "-q", "-D", devices.Capture, "-t", "raw",
+		"-f", "S16_LE", "-r", strconv.Itoa(devices.CaptureRate), "-c", strconv.Itoa(devices.CaptureChannels),
+		"--period-size="+strconv.Itoa(devices.CapturePeriod), "--buffer-size="+strconv.Itoa(devices.CaptureBuffer))
+	play := exec.CommandContext(ctx, "aplay", "--fatal-errors", "-q", "-D", devices.Playback, "-t", "raw",
+		"-f", "S16_LE", "-r", strconv.Itoa(devices.PlaybackRate), "-c", strconv.Itoa(devices.PlaybackChannels),
+		"--period-size="+strconv.Itoa(devices.PlaybackPeriod), "--buffer-size="+strconv.Itoa(devices.PlaybackBuffer))
+	captureLog := &bytes.Buffer{}
+	playLog := &bytes.Buffer{}
+	capture.Stderr = captureLog
+	play.Stderr = playLog
 	captured, err := capture.StdoutPipe()
 	if err != nil {
 		return err
@@ -110,10 +143,25 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 	if err != nil {
 		return err
 	}
+	// Playback must claim the voice route first. On ums9620 the DSP voice
+	// playback FE fails with EIO about half a second after a capture stream
+	// takes the same scene, so the order here is load bearing.
 	if err = play.Start(); err != nil {
 		return err
 	}
 	defer func() { cancel(); played.Close(); _ = play.Wait() }()
+	if devices.NeedsVoiceScene {
+		// Playback is up: arm the capture route, give the DSP time to settle,
+		// then open the capture stream.
+		if err = voiceSwitch(ctx, card, voiceCaptureCtl, true); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1500 * time.Millisecond):
+		}
+	}
 	if err = capture.Start(); err != nil {
 		return err
 	}
@@ -144,8 +192,12 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 		}
 	}()
 	go func() {
+		// M8's voice capture FE already streams 8 kHz mono 16-bit, which is the
+		// native AirSIM frame rate: one 20 ms frame is exactly FrameBytes.
+		direct := devices.CaptureRate == 8000 && devices.CaptureChannels == 1
 		d := NewDownsampler()
-		raw := make([]byte, 960*4)
+		period := devices.CapturePeriod * devices.CaptureChannels * 2
+		raw := make([]byte, period)
 		for {
 			if _, e := io.ReadFull(captured, raw); e != nil {
 				// EOF from the ALSA process is a hardware-stream failure, unlike
@@ -153,9 +205,20 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 				if ctx.Err() != nil {
 					failures <- ctx.Err()
 				} else {
-					failures <- errors.New("ALSA capture stream ended")
+					failures <- fmt.Errorf("ALSA capture stream ended: %s", strings.TrimSpace(captureLog.String()))
 				}
 				return
+			}
+			if direct {
+				for off := 0; off+FrameBytes <= len(raw); off += FrameBytes {
+					c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+					if e := writeFull(c, raw[off:off+FrameBytes]); e != nil {
+						failures <- e
+						return
+					}
+					b.TX.Add(1)
+				}
+				continue
 			}
 			frame := d.Convert(raw)
 			c.SetWriteDeadline(time.Now().Add(2 * time.Second))
@@ -169,6 +232,11 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	u := &Upsampler{}
+	toPlayback := u.Convert
+	if devices.PlaybackRate == 8000 && devices.PlaybackChannels == 1 {
+		// M8 accepts the native 8 kHz mono frame as-is.
+		toPlayback = func(frame []byte) []byte { return frame }
+	}
 	last := time.Now()
 	lastWrite := atomic.Int64{}
 	lastWrite.Store(time.Now().UnixNano())
@@ -191,8 +259,8 @@ func (b *Bridge) serve(parent context.Context, c net.Conn, r io.Reader, selfTest
 					failures <- errors.New("PCM uplink stalled")
 					return
 				}
-				if e := writeFull(played, u.Convert(frame)); e != nil {
-					failures <- e
+				if e := writeFull(played, toPlayback(frame)); e != nil {
+					failures <- fmt.Errorf("%w (aplay: %s)", e, strings.TrimSpace(playLog.String()))
 					return
 				}
 				lastWrite.Store(time.Now().UnixNano())

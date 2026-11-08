@@ -14,4 +14,16 @@ git -C "$TASK_SOURCE" add module LICENSE NOTICE THIRD_PARTY_NOTICES.md
 git -C "$TASK_SOURCE" -c user.name='MU300 build' -c user.email='build@localhost' -c commit.gpgsign=false commit -qm 'Pinned upstream Agent baseline'
 git -C "$TASK_SOURCE" apply --check "$HERE/patches/AirSIM-mu300.patch"
 git -C "$TASK_SOURCE" apply "$HERE/patches/AirSIM-mu300.patch"
+# Second, independent patch: render the SIM's own number as E.164 ("+8613...")
+# instead of the bare country-code form some SIMs store.
+git -C "$TASK_SOURCE" apply --check "$HERE/patches/AirSIM-e164.patch"
+git -C "$TASK_SOURCE" apply "$HERE/patches/AirSIM-e164.patch"
+# Third, independent patch: stop the end-grace window from vetoing hangup/answer/
+# DTMF, and return a send timestamp with the SMS reply.
+git -C "$TASK_SOURCE" apply --check "$HERE/patches/AirSIM-m8-sms-callfix.patch"
+git -C "$TASK_SOURCE" apply "$HERE/patches/AirSIM-m8-sms-callfix.patch"
+# The upstream .gitattributes marks the Agent go.mod/go.sum export-ignore, so
+# `git archive` leaves them out and a module-mode build cannot resolve deps.
+git -C "$UPSTREAM" show "$BASE:module/module-agent/go.mod" > "$TASK_SOURCE/module/module-agent/go.mod"
+git -C "$UPSTREAM" show "$BASE:module/module-agent/go.sum" > "$TASK_SOURCE/module/module-agent/go.sum"
 printf '%s\n' "$TASK_SOURCE"

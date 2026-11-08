@@ -1,0 +1,52 @@
+diff --git a/module/module-agent/mu300_calls.go b/module/module-agent/mu300_calls.go
+index 91981f9..7e36198 100644
+--- a/module/module-agent/mu300_calls.go
++++ b/module/module-agent/mu300_calls.go
+@@ -290,19 +290,15 @@ func mu300ControlCommand(action, digit string, target callRecord, calls []callRe
+ }
+ 
+ // Retaining an identity across a gap must not authorize a modem mutation.
+-// Require every retained slot in the fresh snapshot, including peer calls.
++// The refresh already rejects malformed, duplicated or unknown CLCC slots and
++// reconciles cached identities, deliberately keeping a just-ended call in an
++// end-grace window. Comparing raw snapshot lengths afterwards refused every
++// hangup, answer and DTMF sent while any call sat in that grace window — exactly
++// when a user taps hangup. Safety is unchanged: the target identity still comes
++// from the reconciled cache and must match an exact modem slot index.
+ func (a *agent) mu300ControlSnapshot() error {
+-	calls, err := a.mu300RefreshCalls()
+-	if err != nil {
+-		return err
+-	}
+-	a.mu.RLock()
+-	complete := len(calls) == len(a.mu300Calls)
+-	a.mu.RUnlock()
+-	if !complete {
+-		return errors.New("基带通话状态暂未完整确认，请等待刷新后重试；未发送控制命令")
+-	}
+-	return nil
++	_, err := a.mu300RefreshCalls()
++	return err
+ }
+ 
+ func (a *agent) mu300Control(action, expectedID, digit string) error {
+diff --git a/module/module-agent/mu300_sms.go b/module/module-agent/mu300_sms.go
+index 0bea7ed..348e74b 100644
+--- a/module/module-agent/mu300_sms.go
++++ b/module/module-agent/mu300_sms.go
+@@ -413,7 +413,14 @@ func (a *agent) mu300SMSSendHTTP(w http.ResponseWriter, r *http.Request) {
+ 		writeError(w, http.StatusBadGateway, err.Error())
+ 		return
+ 	}
+-	writeJSON(w, http.StatusOK, map[string]any{"sent": true, "segments": n})
++	// Clients render the sent bubble from this reply; without a timestamp the
++	// outgoing message shows no time at all.
++	writeJSON(w, http.StatusOK, map[string]any{
++		"sent":      true,
++		"segments":  n,
++		"timestamp": time.Now().UTC().Format(time.RFC3339),
++		"recipient": strings.TrimSpace(body.Phone),
++	})
+ }
+ 
+ // fmt is used here to keep unsupported operations explicit in internal callers.
