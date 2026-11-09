@@ -289,6 +289,21 @@ sh /opt/airsim-m8/uninstall.sh
 
 编译与二次开发的完整步骤见 **[docs/M8_BUILD_AND_ADAPT.md](docs/M8_BUILD_AND_ADAPT.md)**。
 
+### 仓库结构与构建（0.1.0.31 起）
+
+```
+src/            上游 v0.1.0-r22 原版，一字不改
+overlay/m8/     全部自建改动，按同相对路径覆盖 src
+upstream/r22/   上游原件存档副本（配 tag upstream-r22）
+```
+
+```sh
+sh scripts/build.sh /tmp/build      # src + overlay 合成源码树，不读 git 历史
+sh scripts/bump-version.sh          # 版本只写 overlay/m8/VERSION 一处真源
+```
+
+规范全文见 **[docs/PROJECT-NORMS.md](docs/PROJECT-NORMS.md)**（流程、结构、版本号、发版四段、验收判据）。
+
 ---
 
 ## 7. 版本口径
@@ -330,6 +345,44 @@ daemon `/status.version` 与 Agent `version`（`0.4.7-mu300.<VERSION>`）同串�
 ---
 
 ## 8.1 版本更新说明
+
+### v0.1.0.31-r22-m8（2026-11-09）
+
+**做了什么**
+
+- 仓库按 `src/` + `overlay/m8/` 分层重构：上游原版与自建改动物理分开，构建改由
+  `scripts/build.sh` 叠加合成，不再依赖 git 历史。
+- 新增 `upstream/r22/` 上游原件存档与 `upstream-r22` tag。
+- 新增 `docs/PROJECT-NORMS.md`：流程、结构、版本号、发版四段、验收判据的完整规范。
+- 打包暂存区清掉 6 个历史残留文件（`status.js`、`luci-api.py`、`airis-status.js` 等旧布局产物，
+  `install.sh` 从未安装它们）。
+
+真机验证：
+
+```
+装包后 daemon 0.1.0.31-r22-m8、Agent 0.4.7-mu300.0.1.0.31-r22-m8，服务 running
+页面 v0.1.0.31-r22-m8 正常渲染，备份与恢复、管理设置按钮、插件更新链接均在
+等价性：合并树重编 daemon 与 0.1.0.30 二进制逐字节一致；包内文件仅 VERSION、两个二进制版本串变化
+```
+
+**改了什么**
+
+- `scripts/bump-version.sh`：`r<NN>` 改为从 `VERSION` 读取（不再写死 r22），版本真源指向
+  `overlay/m8/VERSION`，遇到非 `-m8` 在研线直接拒绝。
+- 产物校验口径由 md5 改为 **sha256 + 字节数**。
+- `.gitignore` 增加 `/build/`。
+
+**未修复问题**
+
+- 云端通话接不通（同 0.1.0.30 结论，媒体能建链但整通电话不成立）。
+- 既有 Go 单测 5 条红，未处理。
+
+**本版未包含的功能**
+
+- 网页内在线安装（M8 整包发布，仍走 Release 页手动下载）。
+- iOS 分卡信号、上游 R23 Tailscale 配对。
+
+---
 
 ### v0.1.0.30-r22-m8（2026-11-09）
 
