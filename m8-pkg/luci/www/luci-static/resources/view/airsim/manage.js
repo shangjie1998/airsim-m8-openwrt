@@ -13,7 +13,7 @@ var updatePolicy = rpc.declare({object:'airsim', method:'updates_policy', params
 var installUpdate = rpc.declare({object:'airsim', method:'update_install', params:['tag'], expect:{}, reject:true, nobatch:true});
 var backupMake = rpc.declare({object:'airsim', method:'backup_make', expect:{}, reject:true, nobatch:true});
 var backupRestore = rpc.declare({object:'airsim', method:'backup_restore', params:['payload'], expect:{}, reject:true, nobatch:true});
-var releasesURL = 'https://github.com/kai-wu-cortex/airsim-mu300/releases';
+var releasesURL = 'https://github.com/shangjie1998/airsim-m8-openwrt/releases';
 // The Agent never hardcodes a relay host: it uses whatever the iPhone sends when
 // it pairs. This is the official cloud channel that ships with the client, shown
 // here so it can be seen, replaced or cleared without hunting through configs.
@@ -128,9 +128,9 @@ return view.extend({
    finally { pending = false; refresh(state); }
   }
   function showRelease(result) {
-   var valid = /^v\d+\.\d+\.\d+-r\d+$/.test(result.latest || '');
+   var valid = /^v\d+\.\d+\.\d+-r\d+(-m8)?$/.test(result.latest || '');
    latest = result.status === 'available' && valid ? result.latest : '';
-   var messages = {available:'发现新版本',current:'当前已是此频道最新版本',ahead:'当前构建领先于公开 Release',unknown_version:'当前开发版本无法自动比较',no_release:'此频道暂时没有可安装的发布版本'};
+   var messages = {available:'发现新版本',current:'当前已是此频道最新版本',ahead:'当前构建领先于公开 Release',unknown_version:'当前开发版本无法自动比较',no_release:'M8 为整包发布，此处不做在线安装；请从「打开项目 Release」下载后手动安装'};
    updateResult.textContent = (messages[result.status] || '版本状态未知') + (valid ? ' · '+result.latest : '') + (result.prerelease ? '（开发预览）' : '') + (result.checked_at ? ' · 检查于 '+new Date(result.checked_at).toLocaleString() : '');
    updateLink.href = valid ? releasesURL+'/tag/'+result.latest : releasesURL;
   }
@@ -286,8 +286,8 @@ return view.extend({
      E('p',{'class':'as-caption'},'局域网模式禁用 Relay 注册、心跳和云端命令；云端模式保留局域网通路，但仍须有效的客户端云端配对。'),
      input('relay_url','Relay HTTPS 地址','url','官方云通道默认 ' + DEFAULT_RELAY + '。留空即跟随客户端配对时下发的地址；改成自己的地址后，客户端必须用同一地址重新配对。'),
      E('div',{'class':'as-buttons'},[
-      E('button',{'type':'button','class':'as-text-button',click:function(){ if (fields.relay_url) fields.relay_url.value = DEFAULT_RELAY; }},'填入官方默认'),
-      E('button',{'type':'button','class':'as-text-button',click:function(){ if (fields.relay_url) fields.relay_url.value = ''; }},'改为跟随客户端')
+      E('button',{'type':'button','class':'as-button as-secondary',click:function(){ if (fields.relay_url) fields.relay_url.value = DEFAULT_RELAY; }},'填入官方默认'),
+      E('button',{'type':'button','class':'as-button as-secondary',click:function(){ if (fields.relay_url) fields.relay_url.value = ''; }},'改为跟随客户端')
      ]),
      input('interface','可信 LAN 接口','text','通常为 br-lan。仅绑定该接口的私有 IPv4；不修改路由、防火墙或设备网络。'),
      E('div',{'class':'as-port-fields'},[input('pair_port','配对端口','number'),input('control_port','控制端口','number'),input('pcm_port','PCM 端口','number')]),

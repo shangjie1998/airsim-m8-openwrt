@@ -247,10 +247,10 @@ func diagnosticReport(s map[string]any, settings managementSettings) map[string]
 	}
 }
 
-const releasePage = "https://github.com/kai-wu-cortex/airsim-mu300/releases"
-const releasesAPI = "https://api.github.com/repos/kai-wu-cortex/airsim-mu300/releases?per_page=30"
+const releasePage = "https://github.com/shangjie1998/airsim-m8-openwrt/releases"
+const releasesAPI = "https://api.github.com/repos/shangjie1998/airsim-m8-openwrt/releases?per_page=30"
 
-var releasePattern = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)-r(\d+)$`)
+var releasePattern = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)-r(\d+)(-m8)?$`)
 
 func versionParts(v string) ([]int, bool) {
 	m := releasePattern.FindStringSubmatch(v)
@@ -312,7 +312,7 @@ func selectRelease(releases []githubRelease, current string, previews bool) map[
 		}
 	}
 	if selected == nil {
-		return map[string]any{"ok": true, "status": "no_release", "message": "此频道最近 30 个 Release 中没有匹配的安装包", "url": releasePage}
+		return map[string]any{"ok": true, "status": "no_release", "message": "本机为 M8 定制包：最近 30 个 Release 里没有可在线安装的组件，请到 Release 页下载整包手动安装", "url": releasePage}
 	}
 	_, comparable := versionParts(current)
 	status := "current"
