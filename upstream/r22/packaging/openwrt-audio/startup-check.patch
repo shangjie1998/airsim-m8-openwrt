@@ -1,0 +1,54 @@
+--- a/device/bin/mu300-audio-dsp
++++ b/device/bin/mu300-audio-dsp
+@@ -247,7 +247,7 @@
+     command -v aplay >/dev/null 2>&1 || return 2
+     card=$(awk '/sprdphone/ {print $1; exit}' /proc/asound/cards 2>/dev/null)
+     [ -n "$card" ] || return 2
+-    head -c 192000 /dev/zero | aplay -D "hw:$card,0" -f S16_LE -r 48000 -c 2 -q >/dev/null 2>&1 &
++    head -c 192000 /dev/zero | aplay --fatal-errors -D "hw:$card,0" -f S16_LE -r 48000 -c 2 -q >/dev/null 2>&1 &
+     p=$!
+     sleep 1
+     dsp_running; r=$?
+@@ -268,11 +268,15 @@
+     command -v aplay >/dev/null 2>&1 || return 1
+     card=$(awk '/sprdphone/ {print $1; exit}' /proc/asound/cards 2>/dev/null)
+     [ -n "$card" ] || return 1
+-    dmesg -c >/dev/null 2>&1
++    # Keep the existing kernel log intact. If the marker is evicted while the
++    # bounded probe runs, there is no sufficient evidence and this check fails.
++    marker=$(dmesg 2>/dev/null | tail -n 1)
++    [ -n "$marker" ] || return 1
+     # any PCM open sends the DSP a scene command; the reply is what we are looking for
+-    head -c 192000 /dev/zero | aplay -D "hw:$card,0" -f S16_LE -r 48000 -c 2 -q >/dev/null 2>&1
+-    dmesg 2>/dev/null | grep -q 'aud_send_cmd out,cmd' &&
+-        ! dmesg 2>/dev/null | grep -q 'failed to get command'
++    head -c 192000 /dev/zero | timeout 8 aplay --fatal-errors -D "hw:$card,0" -f S16_LE -r 48000 -c 2 -q >/dev/null 2>&1 || return 1
++    recent=$(dmesg 2>/dev/null | awk -v marker="$marker" '$0 == marker { seen=1; next } seen')
++    printf '%s\n' "$recent" | grep -q 'aud_send_cmd out,cmd' &&
++        ! printf '%s\n' "$recent" | grep -q 'failed to get command'
+ }
+ 
+ case "${1:-status}" in
+@@ -312,7 +316,11 @@
+         echo "set MU300_AGDSP_FW to an AGDSP image for this SoC to start it" >&2
+         exit 0
+     fi
+-    dsp_running && { echo "the DSP is already running"; exit 0; }
++    if dsp_running; then
++        dsp_alive || { echo "DSP power is on but no command reply was verified" >&2; exit 1; }
++        echo "the DSP is already running and answered a command"
++        exit 0
++    fi
+     # The AGDSP power domain is held up for the whole load and start (agdsp_access_en). The reset that "start"
+     # pulses only reaches a powered domain: with it asleep every step reports success and the DSP runs on with
+     # whatever it ran before - after a reboot that is the previous kernel's image, which never answers the new
+@@ -339,7 +347,8 @@
+         dsp_wakes; w=$?
+         case $w in
+             0) echo "wrote $FW ($(wc -c < "$FW") bytes); the power domain comes up on demand"
+-               dsp_alive && echo "and the DSP is running" || echo "but the core is not executing it - see status" ;;
++               if dsp_alive; then echo "and the DSP is running"
++               else echo "no DSP command reply verified after start" >&2; exit 1; fi ;;
+             2) echo "DSP started from $FW ($(wc -c < "$FW") bytes); install alsa-utils to confirm it wakes" ;;
+             *) echo "wrote $FW but the DSP did not wake when a PCM was opened; see dmesg" >&2; exit 1 ;;
+         esac

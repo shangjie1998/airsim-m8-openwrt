@@ -1,0 +1,21 @@
+#!/bin/sh
+if wget -q -T 2 -O - http://127.0.0.1:7581/status 2>/dev/null | jsonfilter -e '@.audio.active' 2>/dev/null | grep -q true; then
+	echo 'Finish the AirSIM call before uninstalling.' >&2
+	exit 1
+fi
+if [ -x /etc/init.d/airsim ]; then
+	/etc/init.d/airsim stop >/dev/null 2>&1
+	/etc/init.d/airsim disable
+fi
+if [ -x /etc/init.d/airsim-update ]; then
+	/etc/init.d/airsim-update stop >/dev/null 2>&1
+	/etc/init.d/airsim-update disable >/dev/null 2>&1
+fi
+if [ -x /etc/init.d/airsim-audio-setup ]; then
+ /etc/init.d/airsim-audio-setup disable >/dev/null 2>&1
+fi
+if [ -L /mnt/mu300-disk/extra/airsim/upstream-voice-startup ]; then
+	mv /mnt/mu300-disk/extra/airsim/upstream-voice-startup /etc/rc.d/S96mu300-voice
+	/etc/init.d/mu300-voice start
+fi
+exit 0

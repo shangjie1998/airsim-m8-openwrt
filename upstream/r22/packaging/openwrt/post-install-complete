@@ -1,0 +1,20 @@
+#!/bin/sh
+# Signed candidate APK owns these helpers. Do not start AirSIM before setup.
+set -eu
+/etc/init.d/airsim-update enable
+/etc/init.d/airsim-update restart
+/etc/init.d/rpcd restart
+if ! /usr/lib/airsim/audio-setup --install; then
+ echo 'AirSIM audio preparation failed. Calls are not ready; see the setup error above.' >&2
+ exit 1
+fi
+state=$(/usr/lib/airsim/audio-setup --status)
+if [ "$state" = ready ]; then
+ if [ "$(uci -q get airsim.main.enabled)" = 1 ]; then
+  /etc/init.d/airsim start
+  /usr/lib/airsim/audio-setup --verify-service
+ fi
+elif [ "$state" != reboot_required ]; then
+ echo 'AirSIM audio state is unknown; not ready for calls.' >&2
+ exit 1
+fi

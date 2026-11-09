@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+START=99
+STOP=8
+USE_PROCD=1
+start_service() {
+	procd_open_instance monitor
+	procd_set_param command /usr/lib/airsim/airsim-mu300d --update-monitor
+	procd_set_param env PATH=/usr/lib/airsim/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/mu300/bin
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}

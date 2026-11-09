@@ -1,0 +1,7 @@
+#!/bin/sh /etc/rc.common
+# Runs after early reservation and before the normal AirSIM service.
+START=97
+boot() {
+ /usr/lib/airsim/audio-setup --resume > /tmp/airsim-audio-setup.log 2>&1
+}
+start() { :; }

@@ -1,0 +1,16 @@
+{
+ "admin/services/airsim": {
+  "title": "AirSIM",
+  "order": 55,
+  "action": {"type": "firstchild"},
+  "depends": {"acl": ["luci-app-airsim"]}
+ },
+ "admin/services/airsim/overview": {
+  "title": "设备概览", "order": 10,
+  "action": {"type": "view", "path": "airsim/overview"}
+ },
+ "admin/services/airsim/manage": {
+  "title": "管理与维护", "order": 20,
+  "action": {"type": "view", "path": "airsim/manage"}
+ }
+}

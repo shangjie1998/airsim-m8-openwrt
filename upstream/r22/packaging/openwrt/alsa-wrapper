@@ -1,0 +1,6 @@
+#!/bin/sh
+ROOT=/usr/lib/airsim/alsa/usr
+export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ALSA_CONFIG_PATH="$ROOT/share/alsa/alsa.conf"
+export ALSA_CONFIG_DIR="$ROOT/share/alsa"
+exec "$ROOT/bin/${0##*/}" "$@"

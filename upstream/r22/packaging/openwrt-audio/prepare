@@ -1,0 +1,35 @@
+#!/bin/sh
+# Independent AirSIM integration. Original MU300 audio tools retain their notices.
+# Installed only by the explicit audio recovery procedure, with the old override saved.
+set -eu
+export PATH="/usr/lib/airsim/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/mu300/bin:/opt/mu300/busybox-bin"
+unset MU300_AUDIO_ANY_BUILD MU300_KREL MU300_KCONFIG MU300_AUDIO_DIR MU300_LIB_MODULES
+for c in mu300-at mu300-voice mu300-audio-dsp pcmhost ctlset amixer aplay arecord; do
+    command -v "$c" >/dev/null || { echo "Missing audio dependency: $c" >&2; exit 1; }
+done
+[ -r /opt/mu300/lib/run-dir.sh ] || { echo 'Missing MU300 runtime library' >&2; exit 1; }
+[ -s /lib/firmware/agdsp.bin ] || { echo 'Existing device DSP firmware is required' >&2; exit 1; }
+mu300-audio-dsp drivers >/dev/null
+# Query through the existing AT owner. Unknown status is not an idle device.
+call_state=$(mu300-at -t 3 AT+CLCC) || {
+    echo 'Call status query failed; audio preparation deferred' >&2; exit 1;
+}
+if ! printf '%s\n' "$call_state" | awk '
+    /\+CLCC:/ { busy=1 }
+    /^[[:space:]]*OK[[:space:]]*$/ { ok=1 }
+    /ERROR/ { bad=1 }
+    END { exit !(ok && !bad && !busy) }'; then
+    echo 'Call status is active or unavailable; audio preparation deferred' >&2
+    exit 1
+fi
+unset call_state
+# Stage installation disables the old watcher and saves its boot entries.
+if [ -x /etc/init.d/mu300-voice ]; then
+    /etc/init.d/mu300-voice stop >/dev/null 2>&1
+fi
+mu300-audio-dsp reserve
+if [ ! -f /run/airsim-dsp-prepared ]; then
+    # Bound vendor probes; a failed start must not create the readiness marker.
+    timeout 90 mu300-audio-dsp start
+    touch /run/airsim-dsp-prepared
+fi

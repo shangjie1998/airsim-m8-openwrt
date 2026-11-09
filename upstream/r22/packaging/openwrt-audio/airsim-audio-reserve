@@ -1,0 +1,8 @@
+#!/bin/sh /etc/rc.common
+# Reserve before vendor hardware and the AirSIM service. Never start a call scene.
+START=10
+boot() {
+    /mnt/mu300-disk/extra/airsim-audio/bin/mu300-audio-dsp reserve \
+        > /tmp/airsim-audio-reserve.log 2>&1
+}
+start() { :; }

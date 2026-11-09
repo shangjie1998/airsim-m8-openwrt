@@ -1,0 +1,16 @@
+AirSIM for MU300
+
+Copyright 2026 AirSIM for MU300 contributors.
+
+Original code and documentation in this repository are made available under
+the PolyForm Noncommercial License 1.0.0:
+https://polyformproject.org/licenses/noncommercial/1.0.0/
+
+The complete text distributed with the pinned AirSIM baseline is included as
+licenses/PolyForm-Noncommercial-1.0.0.md. Commercial use requires separate
+permission from the relevant copyright holders. This is source-available
+software, not a claim that all components are OSI-approved open source.
+
+Third-party code, patches derived from it, tools, libraries and kernel modules
+retain their respective licenses and notices. This file does not relicense
+those components. See THIRD_PARTY_NOTICES.md, NOTICE and SOURCES.md.

@@ -1,0 +1,135 @@
+#!/bin/sh
+# Candidate complete installer. No calls, partition writes, resets or reboots.
+set -eu
+export PATH="/usr/lib/airsim/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/mu300/bin:/opt/mu300/busybox-bin"
+STATE=/mnt/mu300-disk/extra/.airsim-complete-install
+EXT=/mnt/mu300-disk/extra/airsim-audio
+BUNDLE=/usr/lib/airsim/deps/airsim-audio-0.1.0-r16.tar.gz
+BUNDLE_SHA=5af9b2dd888905b453b61273668736c24e1dd67b821d5fdb5a59c807a0134af3
+FW=/lib/firmware/agdsp.bin
+FW_URL=https://github.com/dikeckaan/mu300-audio-firmware/releases/download/v1.0/agdsp.bin
+FW_BACKUP=/usr/lib/airsim/deps/agdsp.bin
+FW_SHA=378ceea78dbf013e10625e71efd6fab487d727e371884ae8daf078da2828b937
+fail() { echo "AirSIM audio setup: $*" >&2; exit 1; }
+state() {
+ printf '%s\n' "$1" > "$STATE/status.new"
+ mv "$STATE/status.new" "$STATE/status"
+}
+case ${1:---status} in
+ --status) [ ! -f "$STATE/status" ] || cat "$STATE/status"; exit 0 ;;
+ --verify-service)
+  expected=$(cat /usr/lib/airsim/VERSION)
+  n=0
+  while [ "$n" -lt 15 ]; do
+   payload=$(wget -q -T 2 -O - http://127.0.0.1:7581/status 2>/dev/null || true)
+   actual=$(printf '%s' "$payload" | jsonfilter -e '@.version' 2>/dev/null || true)
+   available=$(printf '%s' "$payload" | jsonfilter -e '@.audio_available' 2>/dev/null || true)
+   agent=$(printf '%s' "$payload" | jsonfilter -e '@.agent.reachable' 2>/dev/null || true)
+   if [ "$actual" = "$expected" ] && [ "$available" = true ] && [ "$agent" = true ]; then
+    echo 'Installed bridge, Agent and audio dependency checks passed.'
+    exit 0
+   fi
+   n=$((n + 1)); sleep 1
+  done
+  fail 'Installed service did not become ready; check AirSIM startup logs' ;;
+ --install|--resume) mode=$1 ;;
+ *) fail 'Usage: audio-setup --install | --resume | --status' ;;
+esac
+if ! /usr/lib/airsim/audio-preflight; then
+ [ ! -d "$STATE" ] || [ -L "$STATE" ] || state failed
+ fail 'Preflight failed; audio setup did not run'
+fi
+umask 077
+[ ! -L "$STATE" ] || fail 'Refusing symlink state directory'
+mkdir -p "$STATE"
+chmod 700 "$STATE"
+boot_id=$(cat /proc/sys/kernel/random/boot_id)
+if ! mkdir "$STATE/lock" 2>/dev/null; then
+ # A power loss must not leave an unremovable lock on the next boot.
+ [ ! -L "$STATE/lock" ] || fail 'Refusing symlink lock'
+ old_boot=$(cat "$STATE/lock/boot" 2>/dev/null || true)
+ [ -n "$old_boot" ] && [ "$old_boot" != "$boot_id" ] || fail 'Setup is already running; inspect the previous setup before retrying'
+ rm -f "$STATE/lock/boot"
+ rmdir "$STATE/lock" && mkdir "$STATE/lock"
+fi
+printf '%s\n' "$boot_id" > "$STATE/lock/boot"
+cleanup() {
+ rc=$?
+ [ -z "${work:-}" ] || rm -rf "$work"
+ if [ "$rc" != 0 ]; then state failed; fi
+ rm -f "$STATE/lock/boot"
+ rmdir "$STATE/lock"
+}
+trap cleanup EXIT
+if [ "$mode" = --install ]; then
+ [ "$(sha256sum "$BUNDLE" | cut -d' ' -f1)" = "$BUNDLE_SHA" ] || fail 'Bundled audio digest mismatch'
+ work=$(mktemp -d /tmp/airsim-audio-setup.XXXXXX)
+ tar -xzf "$BUNDLE" -C "$work"
+ (cd "$work" && sha256sum -c manifest >/dev/null) || fail 'Audio manifest check failed'
+ if [ -d "$EXT" ]; then
+  [ ! -L "$EXT" ] || fail 'Refusing linked audio extension'
+  # Reuse the earlier tested recovery only when all executable/module inputs
+  # match. Never overwrite an unknown extension or the user's prepare override.
+  for name in bin/pcmhost bin/ctlset bin/mu300-hfp bin/mu300-voice bin/mu300-audio-dsp integration/prepare integration/airsim-audio-reserve; do
+   cmp -s "$work/$name" "$EXT/$name" || fail 'Existing audio extension differs; preserved for review'
+  done
+  for file in "$work"/modules/*/*; do
+   relative=${file#"$work"/}
+   cmp -s "$file" "$EXT/$relative" || fail 'Existing audio module differs; preserved for review'
+  done
+  cmp -s /etc/airsim/prepare.local "$work/integration/prepare" || fail 'Custom prepare override differs; preserved for review'
+ else
+  # Preserve existing firmware. The candidate carries a verified copy from the
+  # pinned upstream repository, never a firmware file extracted from a device.
+  if [ ! -s "$FW" ]; then
+   [ ! -e "$FW" ] && [ ! -L "$FW" ] || fail 'Existing empty/linked firmware needs review'
+   state downloading_firmware
+   fw_source=upstream
+   if timeout 25 wget -T 20 -O "$work/agdsp.bin" "$FW_URL" &&
+      [ "$(sha256sum "$work/agdsp.bin" | cut -d' ' -f1)" = "$FW_SHA" ]; then
+    :
+   else
+    [ -f "$FW_BACKUP" ] && [ ! -L "$FW_BACKUP" ] &&
+     [ "$(sha256sum "$FW_BACKUP" | cut -d' ' -f1)" = "$FW_SHA" ] ||
+     fail 'Upstream firmware unavailable or invalid, and local backup failed verification; no audio staged'
+    cp "$FW_BACKUP" "$work/agdsp.bin"
+    fw_source=bundled_backup
+    echo 'Using the verified local firmware backup.'
+   fi
+   [ "$(sha256sum "$work/agdsp.bin" | cut -d' ' -f1)" = "$FW_SHA" ] || fail 'Firmware digest mismatch; no audio staged'
+   mkdir -p /lib/firmware
+   fw_tmp=$(mktemp /lib/firmware/.airsim-firmware.XXXXXX)
+   cp "$work/agdsp.bin" "$fw_tmp"
+   chmod 644 "$fw_tmp"
+   mv "$fw_tmp" "$FW"
+   printf '%s\n' "$FW_SHA" > "$STATE/downloaded-firmware.sha256"
+   printf '%s\n' "$fw_source" > "$STATE/firmware-source"
+  fi
+  "$work/integration/stage-device.sh" --check "$work"
+  state staging
+  printf '%s\n' "$boot_id" > "$STATE/staged-boot"
+  /etc/init.d/airsim-audio-setup enable
+  "$work/integration/stage-device.sh" --stage "$work"
+  state reboot_required
+  echo 'Audio installed. Restart into OpenWrt once; setup will resume automatically. Not ready for calls yet.'
+  exit 0
+ fi
+fi
+if [ -f "$STATE/staged-boot" ] && [ "$(cat "$STATE/staged-boot")" = "$boot_id" ]; then
+ state reboot_required
+ echo 'Restart into OpenWrt once to activate the matching audio modules.'
+ exit 0
+fi
+[ -d "$EXT" ] || fail 'Audio extension is not staged'
+[ "$(cat /sys/module/audio_reserve/parameters/missing 2>/dev/null)" = 0 ] || fail 'Audio memory reservation incomplete'
+[ "$(cat /sys/module/audio_reserve/parameters/ranges 2>/dev/null)" = '0xaf700000,0x300000;0xafa00000,0x600000' ] || fail 'Audio memory reservation ranges differ'
+state preparing
+/etc/airsim/prepare.local
+state ready
+/etc/init.d/airsim enable
+if [ "$mode" = --resume ] && [ "$(uci -q get airsim.main.enabled)" = 1 ]; then
+ /etc/init.d/airsim start
+ "$0" --verify-service
+fi
+/etc/init.d/airsim-audio-setup disable
+echo 'Audio preparation passed. Open LuCI → Services → AirSIM to start and pair.'

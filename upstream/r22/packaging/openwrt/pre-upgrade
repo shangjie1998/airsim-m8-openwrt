@@ -1,0 +1,16 @@
+#!/bin/sh
+# Native AirSIM SMS submissions do not use the dashboard's sms_job directory.
+# Keep this upgrade guard separate from the boot-time audio preflight: the SMS
+# daemon may legitimately be synchronizing its pool during normal boot.
+if pidof mu300-sms >/dev/null; then
+	echo 'Wait for the native SMS operation to finish before upgrading.' >&2
+	exit 1
+else
+	[ "$?" = 1 ] || { echo 'Cannot determine native SMS operation state.' >&2; exit 1; }
+fi
+if wget -q -T 3 -O - http://127.0.0.1:7581/status 2>/dev/null | jsonfilter -e '@.audio.active' -e '@.call_active' 2>/dev/null | grep -q true; then
+	echo 'Finish the AirSIM call before upgrading.' >&2
+	exit 1
+fi
+[ ! -x /etc/init.d/airsim ] || /etc/init.d/airsim stop >/dev/null 2>&1
+exit 0

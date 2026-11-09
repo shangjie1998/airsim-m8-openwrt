@@ -1,0 +1,29 @@
+#!/bin/sh
+# Complete-install profile guard. This script does not write files or touch DSP.
+set -eu
+export PATH="/usr/lib/airsim/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/mu300/bin:/opt/mu300/busybox-bin"
+fail() { echo "AirSIM complete installation: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'Root required'
+[ -f /etc/openwrt_release ] || fail 'OpenWrt required'
+[ "$(uname -m)" = aarch64 ] || fail 'aarch64 required'
+[ "$(uname -r)" = 5.4.254-gb50db5b6224c ] || fail 'No verified audio bundle for this kernel; audio setup cannot continue'
+config=$(gzip -dc /proc/config.gz | grep -E '^(CONFIG_|# CONFIG_)' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+[ "$config" = 1057cb97e0d2d7f26816e8bf7841faac1153833a01d4893cdc196b75ae6356b3 ] || fail 'Audio bundle does not match kernel configuration'
+grep -q ' /mnt/mu300-disk ' /proc/mounts || fail 'Persistent MU300 disk is not mounted'
+[ -r /opt/mu300/lib/run-dir.sh ] || fail 'MU300 runtime library missing'
+for tool in mu300-at sha256sum tar timeout wget jsonfilter ubus cmp; do command -v "$tool" >/dev/null || fail "Missing $tool"; done
+calls=$(mu300-at -t 3 AT+CLCC) || fail 'Cannot determine call state'
+printf '%s\n' "$calls" | awk '
+ /\+CLCC:/ { busy=1 }
+ /^[[:space:]]*OK[[:space:]]*$/ { ok=1 }
+ /ERROR/ { bad=1 }
+ END { exit !(ok && !busy && !bad) }' || fail 'Finish all calls; unknown call state also blocks installation'
+unset calls
+! pidof pcmhost aplay arecord mu300-hfp >/dev/null || fail 'Audio streams are active'
+if ubus list mu300dash 2>/dev/null | grep -q '^mu300dash$'; then
+ job=$(ubus call mu300dash sms_job) || fail 'SMS task state unavailable'
+ running=$(printf '%s' "$job" | jsonfilter -e '@.running' || true)
+ [ "$running" != 1 ] || fail 'SMS task is active'
+ printf '%s' "$job" | jsonfilter -e '@.none' -e '@.done' | grep -q '^1$' || fail 'SMS task state unknown'
+fi
+echo 'Matched audio kernel/configuration; call, media and SMS preflight passed.'

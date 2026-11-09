@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+if [ -x /usr/lib/airsim/audio-setup ]; then
+ state=$(/usr/lib/airsim/audio-setup --status)
+ case "$state" in
+  ready) ;;
+  reboot_required) echo 'Restart into OpenWrt once; audio setup resumes automatically before AirSIM.' >&2; exit 1 ;;
+  *) echo 'Audio setup has not completed. Check the installation error before starting AirSIM.' >&2; exit 1 ;;
+ esac
+fi
+# Optional root-owned hardware preparation retained across plugin upgrades.
+# The package does not create this override or enable driver-version bypasses.
+if [ -f /etc/airsim/prepare.local ]; then
+	exec /bin/sh /etc/airsim/prepare.local
+fi
+export PATH="/usr/lib/airsim/bin:$PATH:/opt/mu300/bin:/opt/mu300/busybox-bin"
+# Firmware/kernel release numbers do not gate startup. Reuse the installed
+# audio stack; never auto-install the bundled legacy kernel modules.
+for c in mu300-at mu300-voice mu300-audio-dsp; do
+	command -v "$c" >/dev/null || { echo "Missing $c; install mu300-audio and the required MU300 tools for this device" >&2; exit 1; }
+done
+if [ ! -f /lib/firmware/agdsp.bin ]; then
+	mu300-audio-dsp install --download
+fi
+for c in amixer aplay arecord; do command -v "$c" >/dev/null || { echo "Missing $c" >&2; exit 1; }; done
+umask 077
+mkdir -p /mnt/mu300-disk/extra/airsim/data
+# Do not transfer hardware ownership during a live call.
+if mu300-at 'AT+CLCC' | grep -q '+CLCC:'; then
+	echo 'Finish the current call before starting AirSIM' >&2
+	exit 1
+fi
+# One owner of scene teardown. Stop the upstream follower before starting ours.
+if [ -x /etc/init.d/mu300-voice ]; then
+	/etc/init.d/mu300-voice stop >/dev/null 2>&1 || true
+	if [ -L /etc/rc.d/S96mu300-voice ]; then
+		mv /etc/rc.d/S96mu300-voice /mnt/mu300-disk/extra/airsim/upstream-voice-startup
+	fi
+fi
+# start is idempotent when the DSP is already running; never call stop/reset.
+if [ ! -f /run/airsim-dsp-prepared ]; then
+	mu300-audio-dsp start
+	touch /run/airsim-dsp-prepared
+fi

@@ -1,0 +1,13 @@
+/out/
+/dist/
+/sdk/
+.DS_Store
+/backups/
+/.playwright-mcp/
+*.log
+*.pem
+*.key
+*.apk
+*.pcm
+*.wav
+*.pcap

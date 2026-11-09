@@ -1,0 +1,191 @@
+diff --git a/device/bin/mu300-audio-dsp b/device/bin/mu300-audio-dsp
+index 28f355a..0b0aac3 100755
+--- a/device/bin/mu300-audio-dsp
++++ b/device/bin/mu300-audio-dsp
+@@ -59,9 +59,8 @@ config_sum() {
+     case $_c in *.gz) gzip -dc "$_c" ;; *) cat "$_c" ;; esac 2>/dev/null | grep -E '^(CONFIG_|# CONFIG_)' | LC_ALL=C sort |
+         sha256sum | cut -d' ' -f1
+ }
+-# set_fits DIR: the extra's set in DIR was built for the running kernel's build (MU300_AUDIO_ANY_BUILD=1: take it anyway)
++# set_fits DIR: require the running kernel's exact configuration; no bypass.
+ set_fits() {
+-    [ "${MU300_AUDIO_ANY_BUILD:-}" = 1 ] && return 0
+     _want=$(sed -n 's/^CONFIG=//p' "$1/KERNEL" 2>/dev/null)
+     [ -n "$_want" ] && [ "$(config_sum)" = "$_want" ]
+ }
+@@ -70,16 +69,13 @@ audio_dir() {
+     for _s in "$EXTRA_DIR/modules/$KREL" "$EXTRA_DIR/modules/$KREL"+*; do
+         if [ -f "$_s/sprd_audcp_boot.ko" ] && set_fits "$_s"; then echo "$_s"; return 0; fi
+     done
+-    for d in "$K/audio" "$K/extra" "$K"; do
+-        [ -f "$d/sprd_audcp_boot.ko" ] && { echo "$d"; return 0; }
+-    done
+     return 1
+ }
+ why_none() {
+     _s=$EXTRA_DIR/modules/$KREL
+     if [ -f "$_s/sprd_audcp_boot.ko" ]; then
+         _t=$(for _d in "$_s" "$_s"+*; do [ ! -f "$_d/KERNEL" ] || sed -n 's/^TAG=/mu300-linux /p' "$_d/KERNEL"; done | sed -n '1h;1!H;${x;s/\n/, /g;p;}')
+-        echo "the audio extra's drivers for $KREL were built for another build of it ($_t): not loaded. Update the extra; MU300_AUDIO_ANY_BUILD=1 takes them anyway"
++        echo "the audio extra's drivers for $KREL were built for another build of it ($_t): not loaded. Install a matching audio extension."
+     elif ls -d "$EXTRA_DIR"/modules/* >/dev/null 2>&1; then
+         echo "the audio extra has drivers for $(cd "$EXTRA_DIR/modules" && ls | tr '\n' ' ')and this is $KREL: a newer mu300-audio may have this kernel's"
+     else
+@@ -135,21 +131,25 @@ loaded() { grep -q "^$(echo "$1" | tr '-' '_') " /proc/modules; }
+ # vaudio, ucp1301: nothing on these boards uses them)
+ present() { for m in $MODULES; do [ -f "$A/$m.ko" ] && echo "$m"; done; }
+ 
+-# reserve: the DSP's ranges are audio_reserve's (missing 0). What is still in use after the module took the free
+-# pages is mostly page cache: dropped, then tried once more.
++# reserve: missing=0 means every page was taken and its cache was cleaned.
++# Incomplete reservations fail without dropping the system's page cache.
+ RESERVE=/sys/module/audio_reserve/parameters
+ reserve() {
++    # Existing legacy drivers can still be using these pages. Never reclaim
++    # their live memory; activation requires a clean boot with this service first.
++    if loaded audio_mem && { [ ! -d "$RESERVE" ] || [ "$(cat "$RESERVE/missing" 2>/dev/null)" != 0 ]; }; then
++        echo "legacy audio driver already loaded without a verified reservation; clean boot required" >&2
++        return 1
++    fi
+     if [ ! -d "$RESERVE" ]; then
+         [ -f "$A/audio_reserve.ko" ] || { echo "no audio_reserve.ko in $A" >&2; return 1; }
+         insmod "$A/audio_reserve.ko" "ranges=$DDR32;$DSPBIN" || { echo "audio_reserve did not load" >&2; return 1; }
+     fi
++    [ "$(cat "$RESERVE/ranges" 2>/dev/null)" = "$DDR32;$DSPBIN" ] || {
++        echo "audio reservation covers different or unknown ranges" >&2; return 1;
++    }
+     _m=$(cat "$RESERVE/missing" 2>/dev/null)
+     [ "$_m" = 0 ] && return 0
+-    sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null
+-    echo 1 > "$RESERVE/retry" 2>/dev/null
+-    _r=$(cat "$RESERVE/missing" 2>/dev/null)
+-    [ "$_r" = 0 ] && { echo "$_m pages of the DSP's memory were in use: taken after dropping the page cache"; return 0; }
+-    _m=$_r
+     echo "${_m:-?} pages of the DSP's memory are in use (dmesg: audio_reserve); a reboot takes them at boot" >&2
+     return 1
+ }
+diff --git a/kernel/common/audio_reserve/audio_reserve.c b/kernel/common/audio_reserve/audio_reserve.c
+index 68244f7..ecdfb10 100644
+--- a/kernel/common/audio_reserve/audio_reserve.c
++++ b/kernel/common/audio_reserve/audio_reserve.c
+@@ -43,6 +43,7 @@ struct ar_range {
+ static struct ar_range rg[MAX_RANGES];
+ static int nr;
+ static unsigned long missing_pages;
++static bool cache_ready;
+ static DEFINE_MUTEX(lock);
+ static LIST_HEAD(hold);
+ static struct zone *zone;
+@@ -53,7 +54,11 @@ MODULE_PARM_DESC(ranges, "BASE,SIZE[;BASE,SIZE...] physical ranges to take");
+ 
+ static int missing_get(char *buf, const struct kernel_param *kp)
+ {
+-	return sprintf(buf, "%lu\n", missing_pages);
++	int ret;
++	mutex_lock(&lock);
++	ret = !missing_pages && !cache_ready ? -EIO : sprintf(buf, "%lu\n", missing_pages);
++	mutex_unlock(&lock);
++	return ret;
+ }
+ static const struct kernel_param_ops missing_ops = { .get = missing_get };
+ module_param_cb(missing, &missing_ops, NULL, 0444);
+@@ -208,16 +213,21 @@ static void contig(void) { }
+ 
+ /* no line of a page taken may stay dirty in the cacheable linear map: the DSP and audio_mem's uncached mapping
+  * would see it written back over them later */
+-static void clean(void)
++static bool clean(void)
+ {
+ 	struct platform_device *pd;
+ 	struct device *dev;
+ 	dma_addr_t a;
+ 	int i;
++	bool ok = false;
++
++	/* Never DMA-map a range containing pages still owned by the OS. */
++	if (missing_pages)
++		return false;
+ 
+ 	pd = platform_device_register_simple("audio_reserve", -1, NULL, 0);
+ 	if (IS_ERR(pd))
+-		return;
++		return false;
+ 	dev = &pd->dev;
+ 	if (!dev->dma_mask)
+ 		dev->dma_mask = &dev->coherent_dma_mask;
+@@ -231,12 +241,14 @@ static void clean(void)
+ 		a = dma_map_page(dev, pfn_to_page(rg[i].start), 0, len, DMA_BIDIRECTIONAL);
+ 		if (dma_mapping_error(dev, a)) {
+ 			pr_warn("could not clean the cache of range %d\n", i);
+-			continue;
++			goto out;
+ 		}
+ 		dma_unmap_page(dev, a, len, DMA_BIDIRECTIONAL);
+ 	}
++	ok = true;
+ out:
+ 	platform_device_unregister(pd);
++	return ok;
+ }
+ 
+ static void report(void)
+@@ -275,8 +287,8 @@ static void claim(void)
+ {
+ 	static const gfp_t types[] = { __GFP_MOVABLE, __GFP_RECLAIMABLE, 0 };
+ 	const gfp_t base = __GFP_NOWARN | __GFP_NORETRY | __GFP_NOMEMALLOC;
+-	unsigned long before = missing_pages;
+ 	int i, cpu;
++	cache_ready = false;
+ 
+ 	contig();
+ 	for (i = 0; i < ARRAY_SIZE(types) && missing_pages; i++)
+@@ -291,21 +303,23 @@ static void claim(void)
+ 	}
+ 	cpus_read_unlock();
+ 	release_hold();
+-	if (before != missing_pages)
+-		clean();
++	if (!missing_pages)
++		cache_ready = clean();
+ 	if (missing_pages)
+ 		report();
+-	else
++	else if (cache_ready)
+ 		pr_info("all %d range(s) taken\n", nr);
+ }
+ 
+ static int retry_set(const char *val, const struct kernel_param *kp)
+ {
++	int ret;
+ 	mutex_lock(&lock);
+-	if (missing_pages)
++	if (missing_pages || !cache_ready)
+ 		claim();
++	ret = missing_pages || !cache_ready ? -EBUSY : 0;
+ 	mutex_unlock(&lock);
+-	return missing_pages ? -EBUSY : 0;
++	return ret;
+ }
+ static const struct kernel_param_ops retry_ops = { .set = retry_set };
+ module_param_cb(retry, &retry_ops, NULL, 0200);
+@@ -328,6 +342,8 @@ static int parse(void)
+ 		size = memparse(p, &next);
+ 		if (next == p || !size || !PAGE_ALIGNED(base) || !PAGE_ALIGNED(size))
+ 			return -EINVAL;
++		if ((*next && *next != ';') || base + size <= base || base + size > (1ULL << 32))
++			return -EINVAL;
+ 		p = *next == ';' ? next + 1 : next;
+ 		rg[nr].start = PHYS_PFN(base);
+ 		rg[nr].end = PHYS_PFN(base + size);
+@@ -380,8 +396,10 @@ static int __init audio_reserve_init(void)
+ 	mutex_lock(&lock);
+ 	if (missing_pages)
+ 		claim();
+-	else
++	else {
++		cache_ready = true;
+ 		pr_info("the kernel reserved the range(s) already\n");
++	}
+ 	mutex_unlock(&lock);
+ 	return 0;
+ }

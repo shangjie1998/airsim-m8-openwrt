@@ -1,0 +1,9 @@
+# Preserve upstream subdirectory Kbuilds, resolve their exports in one modpost.
+obj-m += sprd_audio/agdsp_access/ sprd_audio/audiomem/ sprd_audio/audiosipc/
+obj-m += sprd_audio/audiocpboot/ sprd_audio/audiodvfs/ sprd_audio/audiodspdump/
+obj-m += sprd_audio/mcdt/mcdt_r2p0/ sprd_audio/audio_pipe/ sprd_audio/audiopipe/ sprd_audio/saudio/
+obj-m += sprd/platform/platform_routing/ sprd/platform/dmaengine_pcm/ sprd/platform/compr_2stage_dma/
+obj-m += sprd/dai/sprd_dai/ sprd/dai/vaudio/ sprd/dai/vbc/v4/vbc_dai/ sprd/dai/vbc/v4/fe_dai/
+obj-m += sprd/codec/sprd/ump9620/power/ sprd/codec/sprd/ump9620/power_dev/ sprd/codec/sprd/ump9620/codec/
+obj-m += sprd/codec/dummy-codec/ sprd/codec/sprd/ucp1301/ sprd/machine/sprd_card/
+obj-m += audio_reserve/

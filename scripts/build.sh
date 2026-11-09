@@ -1,30 +1,19 @@
 #!/bin/sh
+# 合成源码树：src/（上游原版，一字不改）+ overlay/m8/（自建改动）
+#
+# 用法：sh scripts/build.sh [输出目录]    默认输出到仓库根的 build/
+# 约定：不读 git 历史（上游只发剥了 .git 的源码包），只做目录叠加。
 set -eu
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-AGENT_TREE=$(sh "$HERE/scripts/prepare-agent.sh")
-AGENT_SOURCE=$AGENT_TREE/module/module-agent
-VERSION=$(cat "$HERE/VERSION")
-mkdir -p "$HERE/out/linux-arm64"
-# Nested worktrees can stamp the enclosing repository instead of this release;
-# the isolated Agent also has a temporary baseline commit. Use explicit release
-# versions and the accompanying committed source archive, not those VCS stamps.
-(cd "$HERE"; CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags="-s -w -X main.version=$VERSION" -o out/linux-arm64/airsim-mu300d ./cmd/airsim-mu300d)
-(cd "$AGENT_SOURCE"; CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags="-s -w -X main.agentVersion=0.4.7-mu300.$VERSION" -o "$HERE/out/linux-arm64/airsim-agent" .)
-mkdir -p "$HERE/out/upstream-notices"
-cp "$AGENT_TREE/LICENSE" "$AGENT_TREE/NOTICE" "$AGENT_TREE/THIRD_PARTY_NOTICES.md" "$HERE/out/upstream-notices/"
-# Preserve licenses for the exact Go dependencies compiled into both executables.
-(cd "$HERE"; go mod vendor -o "$HERE/out/_vendor-plugin")
-(cd "$AGENT_SOURCE"; go mod vendor -o "$HERE/out/_vendor-agent")
-for component in plugin agent; do
- vendor=$HERE/out/_vendor-$component
- licenses=$HERE/out/dependency-licenses/$component
- mkdir -p "$licenses"
- cp "$vendor/modules.txt" "$licenses/modules.txt"
- find "$vendor" -type f \( -iname '*license*' -o -iname '*copying*' -o -iname '*notice*' -o -name PATENTS \) | while IFS= read -r file; do
-  relative=${file#"$vendor"/}
-  mkdir -p "$licenses/$(dirname "$relative")"
-  cp "$file" "$licenses/$relative"
- done
-done
-cp "$(go env GOROOT)/LICENSE" "$HERE/out/dependency-licenses/Go-LICENSE"
-printf 'Built %s\n' "$HERE/out/linux-arm64"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+OUT=${1:-$ROOT/build}
+
+[ -d "$ROOT/src" ] || { echo "缺少 src/（上游原版）" >&2; exit 1; }
+[ -d "$ROOT/overlay/m8" ] || { echo "缺少 overlay/m8/（自建改动）" >&2; exit 1; }
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+cp -R "$ROOT/src/." "$OUT/"
+cp -R "$ROOT/overlay/m8/." "$OUT/"
+
+[ -f "$OUT/VERSION" ] || { echo "合成后没有 VERSION；检查 overlay/m8/VERSION" >&2; exit 1; }
+echo "合并完成：${OUT}（VERSION=$(cat "$OUT/VERSION")）"

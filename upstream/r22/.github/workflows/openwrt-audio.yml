@@ -1,0 +1,79 @@
+name: OpenWrt audio recovery candidate
+on:
+  push:
+    branches: [codex/openwrt-audio-recovery]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: openwrt-audio-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Fetch fixed public sources and current-system reference modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/openwrt-audio/{downloads,linux-reference,audio-reference,evidence,release-kernel}
+          D=out/openwrt-audio/downloads
+          curl -fL --retry 3 --max-time 300 https://codeload.github.com/Enceka/android_kernel_zte_ums9620_mifi_u30air/tar.gz/b50db5b6224c11db42a246e8fcdaad1e1d59f478 -o "$D/zte-b50db5b.tar.gz"
+          curl -fL --retry 3 --max-time 120 https://api.github.com/repos/dikeckaan/mu300-linux/tarball/v2026.10.30.1 -o "$D/linux.tar.gz"
+          curl -fL --retry 3 --max-time 120 https://github.com/dikeckaan/mu300-linux/releases/download/v2026.10.30.1/mu300-kernel.tar.gz -o "$D/modules.tar.gz"
+          printf '%s  %s\n' 857c5fd717a7f93668be7df87243f733c8c5b1edc66eda03672c982a43a81ef1 "$D/zte-b50db5b.tar.gz" eda640c335faeb79133cad1cb09f35958ca972eb6b9adc82243ec8bebea5cec6 "$D/linux.tar.gz" 01a29c853be8bf202a2f1d3c47cb434c5cabb53ce23137646fd4380242d8e1b2 "$D/modules.tar.gz" | sha256sum -c -
+          tar -xzf "$D/linux.tar.gz" --strip-components=1 -C out/openwrt-audio/linux-reference
+          tar -xzf "$D/modules.tar.gz" -C out/openwrt-audio/release-kernel ./modules ./modules-u30air
+          git init out/openwrt-audio/audio-reference
+          git -C out/openwrt-audio/audio-reference remote add origin https://github.com/kai-wu-cortex/mu300-audio.git
+          git -C out/openwrt-audio/audio-reference fetch --depth=1 origin 53cbe6a7344b7fa175ff87a73630f05e5862f483
+          git -C out/openwrt-audio/audio-reference checkout --detach FETCH_HEAD
+          test "$(git -C out/openwrt-audio/audio-reference rev-parse HEAD)" = 53cbe6a7344b7fa175ff87a73630f05e5862f483
+          git -C out/openwrt-audio/audio-reference apply "$GITHUB_WORKSPACE/packaging/openwrt-audio/guard-reservation.patch"
+          git -C out/openwrt-audio/audio-reference apply "$GITHUB_WORKSPACE/packaging/openwrt-audio/startup-check.patch"
+      - name: Reservation guards
+        run: |
+          AIRSIM_AUDIO_SOURCE=out/openwrt-audio/audio-reference python3 scripts/openwrt-audio.test.py
+          AIRSIM_AUDIO_SOURCE=out/openwrt-audio/audio-reference python3 scripts/openwrt-audio-dsp.test.py
+          python3 scripts/openwrt-audio-prepare.test.py
+          python3 scripts/openwrt-audio-abi.test.py
+      - name: Build matching kernel symbol table and audio modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t airsim-openwrt-audio-build out/openwrt-audio/linux-reference/kernel
+          docker volume create airsim-openwrt-build
+          docker run --rm -e JOBS=4 -v airsim-openwrt-build:/build \
+            -v "$PWD/out/openwrt-audio/downloads:/inputs:ro" \
+            -v "$PWD/out/openwrt-audio/linux-reference:/linux-reference:ro" \
+            -v "$PWD/out/openwrt-audio/audio-reference:/audio-reference:ro" \
+            -v "$PWD/out/openwrt-audio/evidence:/evidence" \
+            -v "$PWD/packaging/openwrt-audio:/recipe:ro" \
+            airsim-openwrt-audio-build bash -c 'set -e; bash /recipe/build-kernel.sh compile; bash /recipe/build-audio.sh' \
+            2>&1 | tee out/openwrt-audio/evidence/build.log
+      - name: Verify reference CRCs and all candidate imports
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" out/openwrt-audio/evidence
+          python3 scripts/openwrt-audio-abi.py \
+            --kernel-symvers out/openwrt-audio/evidence/openwrt-Module.symvers \
+            --audio-symvers out/openwrt-audio/evidence/audio-Module.symvers \
+            --references out/openwrt-audio/release-kernel \
+            --candidates out/openwrt-audio/evidence/audio-modules \
+            --report out/openwrt-audio/evidence/abi-report.json
+      - name: Retain candidate and build evidence (never publish a Release)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: openwrt-audio-candidate-${{ github.sha }}
+          retention-days: 14
+          path: |
+            out/openwrt-audio/evidence/build.log
+            out/openwrt-audio/evidence/config-merge.log
+            out/openwrt-audio/evidence/*Module.symvers
+            out/openwrt-audio/evidence/audio-modules/*.ko
+            out/openwrt-audio/evidence/audio-SHA256SUMS
+            out/openwrt-audio/evidence/abi-report.json

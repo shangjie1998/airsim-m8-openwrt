@@ -1,0 +1,120 @@
+#!/bin/sh
+# rpcd-exec provides the authenticated LuCI boundary. Arguments never reach a shell command.
+. /usr/share/libubox/jshn.sh
+service_status() {
+	services=$(ubus call service list '{"name":"airsim"}' 2>/dev/null)
+	agent=$(printf '%s' "$services" | jsonfilter -e '@.airsim.instances.agent.running' 2>/dev/null)
+	bridge=$(printf '%s' "$services" | jsonfilter -e '@.airsim.instances.bridge.running' 2>/dev/null)
+	alive=0
+	[ "$agent" != true ] && [ "$bridge" != true ] || alive=1
+	payload=$(wget -q -T 5 -O - http://127.0.0.1:7581/status 2>/dev/null)
+	if [ -n "$payload" ]; then json_load "$payload"; else json_init; json_add_boolean running 0; fi
+	json_add_boolean service_alive "$alive"
+	if [ -x /usr/lib/airsim/audio-setup ]; then
+		setup=$(/usr/lib/airsim/audio-setup --status 2>/dev/null)
+		case "$setup" in ready|reboot_required|downloading_firmware|staging|preparing|failed) ;; *) setup=not_prepared ;; esac
+		json_add_string audio_setup "$setup"
+		[ "$setup" = ready ] || json_add_boolean audio_available 0
+	fi
+	json_dump
+}
+case "$1" in
+list)
+	printf '%s\n' '{"status":{},"settings_get":{},"settings_save":{"config":""},"diagnostics":{},"updates":{"previews":true},"updates_status":{},"updates_policy":{"config":""},"update_install":{"tag":""},"pair_start":{},"pair_cancel":{},"number_refresh":{},"start":{},"stop":{},"call_action":{"action":"","number":"","call_id":"","operation_id":""}}'
+	;;
+call)
+	case "$2" in
+	updates_status)
+		/usr/lib/airsim/airsim-mu300d --manage updates-status
+		;;
+	updates_policy)
+		IFS= read -r request
+		if ! json_load "$request"; then printf '%s\n' '{"error":"无效更新设置"}'; exit 0; fi
+		json_get_var config config
+		printf '%s' "$config" | /usr/lib/airsim/airsim-mu300d --manage updates-policy
+		;;
+	update_install)
+		IFS= read -r request
+		if ! json_load "$request"; then printf '%s\n' '{"error":"无效升级请求"}'; exit 0; fi
+		json_get_var tag tag
+		json_init; json_add_string tag "$tag"
+		json_dump | /usr/lib/airsim/airsim-mu300d --manage update-install
+		;;
+	settings_get|diagnostics)
+		case "$2" in settings_get) operation=get ;; *) operation=diagnostics ;; esac
+		/usr/lib/airsim/airsim-mu300d --manage "$operation"
+		;;
+	settings_save)
+		IFS= read -r request
+		if ! json_load "$request"; then printf '%s\n' '{"error":"无效设置请求"}'; exit 0; fi
+		json_get_var config config
+		# Fail closed for old versions that do not hold the runtime lock yet.
+		services=$(ubus call service list '{"name":"airsim"}' 2>/dev/null) || { printf '%s\n' '{"error":"无法确认服务已停止"}'; exit 0; }
+		if printf '%s' "$services" | jsonfilter -e '@.airsim.instances.*.running' | grep -q true; then
+			printf '%s\n' '{"error":"请先在概览页关闭服务，再保存设置"}'; exit 0
+		fi
+		printf '%s' "$config" | /usr/lib/airsim/airsim-mu300d --manage save
+		;;
+	updates)
+		IFS= read -r request
+		if ! json_load "$request"; then printf '%s\n' '{"error":"无效更新请求"}'; exit 0; fi
+		json_get_var previews previews
+		case "$previews" in 1|true) operation=updates ;; *) operation=updates-stable ;; esac
+		/usr/lib/airsim/airsim-mu300d --manage "$operation"
+		;;
+	call_action)
+		IFS= read -r request
+		if ! json_load "$request"; then printf '%s\n' '{"error":"无效通话请求"}'; exit 0; fi
+		json_get_var action action
+		json_get_var number number
+		json_get_var call_id call_id
+		json_get_var operation_id operation_id
+		case "$action" in dial|answer|hangup) ;; *) printf '%s\n' '{"error":"不支持的通话操作"}'; exit 0 ;; esac
+		json_init
+		json_add_string action "$action"
+		json_add_string number "$number"
+		json_add_string call_id "$call_id"
+		json_add_string operation_id "$operation_id"
+		payload=$(json_dump)
+		wget -q -T 40 --post-data="$payload" -O - http://127.0.0.1:7581/call/action || printf '%s\n' '{"error":"未收到操作结果，请先检查通话状态，勿重复拨号","uncertain":true}'
+		;;
+	status)
+		service_status
+		;;
+	pair_start|pair_cancel)
+		case "$2" in pair_start) action=start ;; pair_cancel) action=cancel ;; esac
+		wget -q -T 5 --post-data='{}' -O - "http://127.0.0.1:7581/pair/$action" || printf '%s\n' '{"error":"AirSIM service is stopped"}'
+		;;
+	number_refresh)
+		wget -q -T 10 --post-data='{}' -O - http://127.0.0.1:7581/number/refresh || printf '%s\n' '{"error":"无法读取号码，请检查服务状态"}'
+		;;
+	start)
+		if [ -x /usr/lib/airsim/audio-setup ]; then
+			setup=$(/usr/lib/airsim/audio-setup --status 2>/dev/null)
+			case "$setup" in
+			 ready) ;;
+			 reboot_required) printf '%s\n' '{"error":"音频组件已安装，请重启进入 OpenWrt 一次，系统会自动完成准备。"}'; exit 0 ;;
+			 *) printf '%s\n' '{"error":"音频安装准备尚未完成，请先检查安装结果。"}'; exit 0 ;;
+			esac
+		fi
+		if ! uci set airsim.main.enabled=1 || ! uci commit airsim || ! /etc/init.d/airsim enable; then
+			printf '%s\n' '{"error":"无法保存服务配置"}'; exit 0
+		fi
+		/etc/init.d/airsim start </dev/null >/tmp/airsim-start.log 2>&1 &
+		printf '%s\n' '{"starting":true}'
+		;;
+	stop)
+		if wget -q -T 3 -O - http://127.0.0.1:7581/status | jsonfilter -e '@.call_active' -e '@.audio.active' | grep -q true; then
+			printf '%s\n' '{"error":"通话进行中，请挂断后再关闭服务"}'; exit 0
+		fi
+		if ! uci set airsim.main.enabled=0 || ! uci commit airsim; then
+			printf '%s\n' '{"error":"无法保存服务配置"}'; exit 0
+		fi
+		/etc/init.d/airsim stop </dev/null >/tmp/airsim-stop.log 2>&1 &
+		printf '%s\n' '{"stopping":true}'
+		;;
+	*) printf '%s\n' '{"error":"unknown_method"}' ;;
+	esac
+	;;
+*) exit 1 ;;
+esac
