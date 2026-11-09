@@ -303,6 +303,9 @@ sh scripts/bump-version.sh          # 版本只写 overlay/m8/VERSION 一处真�
 ```
 
 规范全文见 **[docs/PROJECT-NORMS.md](docs/PROJECT-NORMS.md)**（流程、结构、版本号、发版四段、验收判据）。
+改动的来龙去脉与验没验过，看 **[docs/M8-CHANGE-LEDGER.md](docs/M8-CHANGE-LEDGER.md)**（改动账本）。
+新功能怎么加不打架，看 **[docs/M8-FEATURE-GOVERNANCE.md](docs/M8-FEATURE-GOVERNANCE.md)**（落点选择、公共插座、升级流程）。
+打包前先跑 `sh scripts/check-ledger.sh`：账本没记、版本不一致、产物名不合规都会拦下。
 
 ---
 
