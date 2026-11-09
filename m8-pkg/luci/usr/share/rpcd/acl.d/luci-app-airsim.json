@@ -8,7 +8,8 @@
      "settings_get",
      "diagnostics",
      "updates_status",
-     "pair_clients"
+     "pair_clients",
+     "backup_make"
     ],
     "airsim-call": [
      "call_get",
@@ -35,7 +36,8 @@
      "number_refresh",
      "start",
      "stop",
-     "call_action"
+     "call_action",
+     "backup_restore"
     ],
     "airsim-sms": [
      "sms_list",

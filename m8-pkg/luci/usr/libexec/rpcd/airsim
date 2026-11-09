@@ -18,9 +18,134 @@ service_status() {
 	fi
 	json_dump
 }
+# --- 备份与恢复 -----------------------------------------------------------
+# 备份只含"能恢复本机身份"的东西：插件配置 + 配对凭据 + 运行状态文件。
+# 不打包日志、音频、短信正文与号码，避免把隐私一起拷出去。
+airsim_fingerprint() {
+	cid=$(cat /sys/block/mmcblk0/device/cid 2>/dev/null | tr -d '\n')
+	sn=$(tr -d '\0' < /proc/device-tree/serial-number 2>/dev/null)
+	printf '%s|%s' "$cid" "$sn" | sha256sum | cut -d' ' -f1
+}
+backup_make() {
+	work=/tmp/airsim-backup.$$
+	rm -rf "$work"; mkdir -p "$work/backup/config" "$work/backup/agent-data" "$work/backup/data"
+	[ -f /etc/config/airsim ] && cp -f /etc/config/airsim "$work/backup/config/airsim"
+	[ -f /etc/config/airsim-call-forward ] && cp -f /etc/config/airsim-call-forward "$work/backup/config/airsim-call-forward"
+	if [ -d /opt/airsim-m8/agent-data ]; then
+		cp -a /opt/airsim-m8/agent-data/. "$work/backup/agent-data/" 2>/dev/null
+	fi
+	if [ -d /opt/airsim-m8/data ]; then
+		cp -a /opt/airsim-m8/data/. "$work/backup/data/" 2>/dev/null
+	fi
+	# 日志、音频缓存不进备份
+	rm -f "$work"/backup/agent-data/*.log "$work"/backup/data/*.log "$work"/backup/data/*.log.* 2>/dev/null
+	rmdir "$work"/backup/agent-data "$work"/backup/data 2>/dev/null
+	finger=$(airsim_fingerprint)
+	model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
+	ver=$(ubus call airsim status 2>/dev/null | jsonfilter -e '@.version' 2>/dev/null)
+	host=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+	created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	printf '{"format":"airsim-m8-backup","format_version":1,"fingerprint":"%s","short_id":"%s","model":"%s","hostname":"%s","plugin_version":"%s","created_at":"%s"}\n' \
+		"$finger" "$(printf '%s' "$finger" | cut -c1-8)" "$model" "$host" "$ver" "$created" > "$work/backup/meta.json"
+	if ! tar czf "$work/out.tar.gz" -C "$work/backup" . 2>/dev/null; then
+		rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"打包失败，请检查磁盘空间"}'; return
+	fi
+	siz=$(wc -c < "$work/out.tar.gz" | tr -d ' ')
+	sum=$(sha256sum "$work/out.tar.gz" | cut -d' ' -f1)
+	b64=$(openssl base64 -A -in "$work/out.tar.gz")
+	stamp=$(date +%Y%m%d-%H%M)
+	rm -rf "$work"
+	json_init
+	json_add_boolean ok 1
+	json_add_string filename "airsim-m8-backup-$stamp.tar.gz"
+	json_add_int size "$siz"
+	json_add_string sha256 "$sum"
+	json_add_string fingerprint "$finger"
+	json_add_string short_id "$(printf '%s' "$finger" | cut -c1-8)"
+	json_add_string created_at "$created"
+	json_add_string data "$b64"
+	json_dump
+}
+backup_restore() {
+	IFS= read -r request
+	if ! json_load "$request"; then printf '%s\n' '{"ok":false,"error":"无效恢复请求"}'; return; fi
+	json_get_var payload payload
+	if [ -z "$payload" ]; then printf '%s\n' '{"ok":false,"error":"没有收到备份内容"}'; return; fi
+	work=/tmp/airsim-restore.$$
+	rm -rf "$work"; mkdir -p "$work/x" || { printf '%s\n' '{"ok":false,"error":"无法创建临时目录"}'; return; }
+	if ! printf '%s' "$payload" | openssl base64 -d -A > "$work/in.tar.gz" 2>/dev/null; then
+		rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"文件解码失败，可能不是本插件导出的备份"}'; return
+	fi
+	siz=$(wc -c < "$work/in.tar.gz" | tr -d ' ')
+	if [ "$siz" -gt 8388608 ]; then rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"备份包超过 8 MB，拒绝处理"}'; return; fi
+	if ! tar tzf "$work/in.tar.gz" > "$work/list" 2>/dev/null; then
+		rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"不是有效的 gzip 备份包"}'; return
+	fi
+	# 白名单：只允许本插件自己写出来的路径，防止借备份覆盖系统文件
+	if grep -Ev '^\./(meta\.json|config/(airsim|airsim-call-forward)|agent-data/.+|data/.+)$' "$work/list" \
+		| grep -Ev '^\./(agent-data|data|config)/?$|^\./?$' | grep -q .; then
+		rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"备份包内含不允许的路径，已拒绝导入"}'; return
+	fi
+	if ! tar xzf "$work/in.tar.gz" -C "$work/x" 2>/dev/null; then
+		rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"解包失败"}'; return
+	fi
+	if [ ! -f "$work/x/meta.json" ]; then
+		rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"备份包缺少 meta.json，无法确认是不是本机备份"}'; return
+	fi
+	bang=$(jsonfilter -e '@.format' < "$work/x/meta.json" 2>/dev/null)
+	if [ "$bang" != airsim-m8-backup ]; then
+		rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"这不是 AirSIM 插件的备份文件"}'; return
+	fi
+	bver=$(jsonfilter -e '@.format_version' < "$work/x/meta.json" 2>/dev/null)
+	if [ "${bver:-0}" -gt 1 ]; then
+		rm -rf "$work"; printf '%s\n' '{"ok":false,"error":"备份格式版本过新，请先升级插件"}'; return
+	fi
+	filefinger=$(jsonfilter -e '@.fingerprint' < "$work/x/meta.json" 2>/dev/null)
+	localfinger=$(airsim_fingerprint)
+	if [ -z "$filefinger" ] || [ "$filefinger" != "$localfinger" ]; then
+		# 指纹不符就拒绝：别人的备份里带着别人的配对凭据，装进来只会连到错的设备
+		rm -rf "$work"
+		json_init; json_add_boolean ok 0
+		json_add_string error "这份备份不是本机的（设备指纹不符），已拒绝导入"
+		json_add_string file_id "$(printf '%s' "$filefinger" | cut -c1-8)"
+		json_add_string local_id "$(printf '%s' "$localfinger" | cut -c1-8)"
+		json_dump; return
+	fi
+	# 覆盖前留一份现场，出问题还能手工拿回来
+	keep=/tmp/airsim-before-restore-$(date +%Y%m%d-%H%M%S)
+	mkdir -p "$keep"
+	cp -f /etc/config/airsim "$keep/" 2>/dev/null
+	cp -f /etc/config/airsim-call-forward "$keep/" 2>/dev/null
+	if [ -d /opt/airsim-m8/agent-data ]; then cp -a /opt/airsim-m8/agent-data "$keep/" 2>/dev/null; fi
+	if [ -d /opt/airsim-m8/data ]; then cp -a /opt/airsim-m8/data "$keep/" 2>/dev/null; fi
+	running=$(ubus call service list '{"name":"airsim-m8"}' 2>/dev/null | jsonfilter -e '@.airsim-m8.instances.*.running' | grep -c true)
+	if [ "$running" -gt 0 ]; then /etc/init.d/airsim-m8 stop >/dev/null 2>&1; fi
+	[ -f "$work/x/config/airsim" ] && cp -f "$work/x/config/airsim" /etc/config/airsim
+	[ -f "$work/x/config/airsim-call-forward" ] && cp -f "$work/x/config/airsim-call-forward" /etc/config/airsim-call-forward
+	if [ -d "$work/x/agent-data" ] && [ -n "$(ls -A "$work/x/agent-data" 2>/dev/null)" ]; then
+		mkdir -p /opt/airsim-m8/agent-data
+		cp -a "$work/x/agent-data/." /opt/airsim-m8/agent-data/ 2>/dev/null
+	fi
+	if [ -d "$work/x/data" ] && [ -n "$(ls -A "$work/x/data" 2>/dev/null)" ]; then
+		mkdir -p /opt/airsim-m8/data
+		cp -a "$work/x/data/." /opt/airsim-m8/data/ 2>/dev/null
+		chmod 600 /opt/airsim-m8/data/agent-id 2>/dev/null
+	fi
+	rm -rf "$work"
+	if [ "$running" -gt 0 ]; then
+		/etc/init.d/airsim-m8 enable >/dev/null 2>&1
+		/etc/init.d/airsim-m8 start </dev/null >/tmp/airsim-restore-start.log 2>&1 &
+	fi
+	json_init; json_add_boolean ok 1
+	json_add_string message "备份已恢复，服务正在重启；配对与配置以备份内容为准"
+	json_add_string short_id "$(printf '%s' "$localfinger" | cut -c1-8)"
+	json_add_string before_copy "$keep"
+	json_add_boolean restarted "$([ "$running" -gt 0 ] && echo 1 || echo 0)"
+	json_dump
+}
 case "$1" in
 list)
-	printf '%s\n' '{"status":{},"settings_get":{},"settings_save":{"config":""},"diagnostics":{},"updates":{"previews":true},"updates_status":{},"updates_policy":{"config":""},"update_install":{"tag":""},"pair_start":{},"pair_cancel":{},"pair_clients":{},"pair_remove":{"indexes":""},"number_refresh":{},"start":{},"stop":{},"call_action":{"action":"","number":"","call_id":"","operation_id":"","card":""}}'
+	printf '%s\n' '{"status":{},"settings_get":{},"settings_save":{"config":""},"diagnostics":{},"updates":{"previews":true},"updates_status":{},"updates_policy":{"config":""},"update_install":{"tag":""},"pair_start":{},"pair_cancel":{},"pair_clients":{},"pair_remove":{"indexes":""},"number_refresh":{},"start":{},"stop":{},"call_action":{"action":"","number":"","call_id":"","operation_id":"","card":""},"backup_make":{},"backup_restore":{"payload":""}}'
 	;;
 call)
 	case "$2" in
@@ -61,6 +186,12 @@ call)
 		json_get_var previews previews
 		case "$previews" in 1|true) operation=updates ;; *) operation=updates-stable ;; esac
 		/usr/lib/airsim/airsim-mu300d --manage "$operation"
+		;;
+	backup_make)
+		backup_make
+		;;
+	backup_restore)
+		backup_restore
 		;;
 	call_action)
 		IFS= read -r request

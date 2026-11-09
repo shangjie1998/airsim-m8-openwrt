@@ -11,6 +11,8 @@ var getUpdates = rpc.declare({object:'airsim', method:'updates', params:['previe
 var updateStatus = rpc.declare({object:'airsim', method:'updates_status', expect:{}, reject:true});
 var updatePolicy = rpc.declare({object:'airsim', method:'updates_policy', params:['config'], expect:{}, reject:true, nobatch:true});
 var installUpdate = rpc.declare({object:'airsim', method:'update_install', params:['tag'], expect:{}, reject:true, nobatch:true});
+var backupMake = rpc.declare({object:'airsim', method:'backup_make', expect:{}, reject:true, nobatch:true});
+var backupRestore = rpc.declare({object:'airsim', method:'backup_restore', params:['payload'], expect:{}, reject:true, nobatch:true});
 var releasesURL = 'https://github.com/kai-wu-cortex/airsim-mu300/releases';
 // The Agent never hardcodes a relay host: it uses whatever the iPhone sends when
 // it pairs. This is the official cloud channel that ships with the client, shown
@@ -177,6 +179,101 @@ return view.extend({
   confirmation.appendChild(E('div',{'class':'as-buttons'},[buttons.confirm,cancelUpdate]));
   buttons.save = E('button',{type:'button','class':'as-button as-primary',click:save},'保存设置');
   buttons.diagnostics = E('button',{type:'button','class':'as-button as-secondary',click:diagnostics},'导出脱敏诊断');
+
+  // --- 备份与恢复 ---------------------------------------------------------
+  var backupBusy = false, restoreFile = null, localShortId = '';
+  var backupNote = E('p',{'class':'as-management-feedback','role':'status','aria-live':'polite'});
+  function backupMessage(text, error) {
+   backupNote.textContent = text || '';
+   backupNote.className = 'as-management-feedback' + (error ? ' is-error' : '');
+  }
+  var fileInput = E('input',{type:'file',accept:'.tar.gz,.tgz,application/gzip,application/x-gzip',hidden:true});
+  var pickedName = E('p',{'class':'as-caption'},'尚未选择文件。');
+  var btnRestoreConfirm = E('button',{type:'button','class':'as-button as-primary',click:async function(){
+   if (backupBusy || !restoreFile) return;
+   restorePanel.hidden = true;
+   backupBusy = true; syncBackupButtons(); backupMessage('正在导入备份并重启服务…');
+   try {
+    var payload = await readBase64(restoreFile);
+    var result = await backupRestore(payload);
+    if (!result || result.ok === false) throw Error((result && result.error) || '恢复未确认，请刷新后核对状态');
+    backupMessage(result.message || '备份已恢复，服务正在重启。');
+    restoreFile = null; pickedName.textContent = '尚未选择文件。';
+   } catch(e) { backupMessage(e.message || '恢复失败，请重试。', true); }
+   finally { backupBusy = false; syncBackupButtons(); }
+  }},'确认覆盖');
+  var btnRestoreCancel = E('button',{type:'button','class':'as-button as-secondary',click:function(){ restorePanel.hidden = true; }},'取消');
+  var restorePanel = E('div',{'class':'as-feedback as-feedback-error',hidden:true},[
+   E('strong',{},'确认用这份备份覆盖本机数据？'),
+   E('p',{},'会覆盖当前插件配置、配对凭据与运行状态，并重启电话服务。覆盖前会把现在的状态另存到 /tmp/airsim-before-restore-*。'),
+   E('div',{'class':'as-buttons'},[btnRestoreConfirm,btnRestoreCancel])
+  ]);
+  var btnRestore = E('button',{type:'button','class':'as-button as-primary',click:function(){
+   if (!restoreFile || backupBusy) return;
+   restorePanel.hidden = false;
+   backupMessage('已读取文件，请确认覆盖。');
+  }},'恢复这份备份');
+  var btnBackup = E('button',{type:'button','class':'as-button as-primary',click:async function(){
+   if (backupBusy) return;
+   backupBusy = true; syncBackupButtons(); backupMessage('正在打包配置与配对资料…');
+   try {
+    var result = await backupMake();
+    if (!result || result.ok === false || !result.data) throw Error((result && result.error) || '打包失败');
+    localShortId = result.short_id || '';
+    var blob = base64ToBlob(result.data, 'application/gzip');
+    var url = URL.createObjectURL(blob);
+    var link = E('a',{href:url,download:result.filename || 'airsim-m8-backup.tar.gz'});
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1500);
+    backupMessage('已交给浏览器保存（' + (result.size ? Math.round(result.size/1024) + ' KB' : '大小未知') + '，本机标识 ' + (result.short_id || '--') + '）。恢复时校验的就是这个标识。');
+   } catch(e) { backupMessage(e.message || '备份失败，请重试。', true); }
+   finally { backupBusy = false; syncBackupButtons(); }
+   function base64ToBlob(b64, type) {
+    var bin = atob(b64.replace(/\s+/g,'')), arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], {type:type});
+   }
+  }},'备份到电脑');
+  function readBase64(file) {
+   return new Promise(function(resolve, reject){
+    var reader = new FileReader();
+    reader.onload = function(){ var s = String(reader.result || ''); var i = s.indexOf(','); resolve(i >= 0 ? s.slice(i+1) : s); };
+    reader.onerror = function(){ reject(Error('读取文件失败')); };
+    reader.readAsDataURL(file);
+   });
+  }
+  function syncBackupButtons() {
+   btnBackup.disabled = backupBusy;
+   btnRestore.disabled = backupBusy || !restoreFile;
+   btnRestoreConfirm.disabled = backupBusy || !restoreFile;
+   pickButton.disabled = backupBusy;
+  }
+  var pickButton = E('button',{type:'button','class':'as-button as-secondary',click:function(){ if (!backupBusy) fileInput.click(); }},'选择备份文件');
+  var dropZone = E('div',{'class':'as-backup-drop',tabindex:'0'},[
+   E('strong',{},'把备份文件拖到这里'),
+   E('span',{},'或点「选择备份文件」。只接受本插件导出、且属于这台机器的 .tar.gz')
+  ]);
+  dropZone.addEventListener('dragover', function(ev){ ev.preventDefault(); dropZone.className = 'as-backup-drop is-active'; });
+  dropZone.addEventListener('dragleave', function(){ dropZone.className = 'as-backup-drop'; });
+  dropZone.addEventListener('drop', function(ev){
+   ev.preventDefault(); dropZone.className = 'as-backup-drop';
+   var files = (ev.dataTransfer && ev.dataTransfer.files) || [];
+   if (files.length) takeFile(files[0]);
+  });
+  dropZone.addEventListener('click', function(){ if (!backupBusy) fileInput.click(); });
+  dropZone.addEventListener('keydown', function(ev){ if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); if (!backupBusy) fileInput.click(); } });
+  fileInput.addEventListener('change', function(){ if (fileInput.files && fileInput.files.length) takeFile(fileInput.files[0]); });
+  function takeFile(file) {
+   if (backupBusy) return;
+   if (!/\.(tar\.gz|tgz|gz)$/i.test(file.name || '')) { backupMessage('这不是 .tar.gz 备份包，请重新选择。', true); return; }
+   if (file.size > 8388608) { backupMessage('文件超过 8 MB，不像是本插件的备份。', true); return; }
+   restoreFile = file;
+   pickedName.textContent = '已选择：' + file.name + '（' + Math.max(1, Math.round(file.size/1024)) + ' KB）';
+   restorePanel.hidden = true;
+   backupMessage('文件已读入，点「恢复这份备份」后还会再确认一次。');
+   syncBackupButtons();
+  }
+  syncBackupButtons();
   buttons.updates = E('button',{type:'button','class':'as-button as-primary',click:updates},'检查更新');
   var root = E('div',{'class':'as-root'},[
    E('link',{rel:'stylesheet',href:L.resource('view/airsim/overview.css')}),
@@ -201,6 +298,15 @@ return view.extend({
      E('section',{'class':'as-card'},[E('h3',{},'Relay 与运行状态'),E('p',{'class':'as-copy'},'页面设置：'+(settings.relay_url || '未指定 · 跟随客户端配对地址')+'　官方默认：'+DEFAULT_RELAY),relay,runtime,E('p',{'class':'as-caption'},'“已配置”不等于公网可达；命令通道连接也不代表双向语音已验收。')]),
      E('section',{'class':'as-card'},[E('h3',{},'维护工具'),E('p',{'class':'as-copy'},'导出可分享的状态报告。'),E('p',{'class':'as-caption'},'不读取短信正文，不导出号码、IP、Relay 地址、标识、配对码、密钥、原始日志或音频；不会自动上传。'),buttons.diagnostics,
       E('hr',{}),E('h3',{},'插件更新'),E('label',{'class':'as-check-label','for':'as-auto-update'},[automatic,' 自动检查更新（每 6 小时）']),E('label',{'class':'as-check-label','for':'as-previews'},[previews,' 包含开发预览版']),E('p',{'class':'as-caption'},'自动检查只获取公开版本信息，不自动安装。先在概览关闭电话服务，再更新；安装前验证签名、设备与通话/短信空闲状态。'),buttons.updates,updateResult,buttons.install,confirmation,jobResult,updateLink]),
+     E('section',{'class':'as-card'},[E('h3',{},'备份与恢复'),
+      E('p',{'class':'as-copy'},'把插件配置、配对凭据和运行状态打成一个 .tar.gz 存到电脑；换固件、刷机、折腾完再导回来。'),
+      E('p',{'class':'as-caption'},'备份包按本机硬件指纹标记，恢复时先校验指纹，别人的备份会被直接拒绝，不会把别的设备的配对凭据装进来。日志、音频、短信正文都不进包。'),
+      btnBackup,
+      backupNote,
+      E('hr',{}),
+      dropZone,fileInput,pickButton,pickedName,btnRestore,restorePanel,
+      E('p',{'class':'as-caption','style':'margin-top:10px'},'恢复会覆盖当前配置与配对资料并重启服务，覆盖前自动把现在的状态存到 /tmp/airsim-before-restore-*。')
+     ]),
      E('section',{'class':'as-card'},[E('h3',{},'版本说明'),E('p',{'class':'as-copy'},'当前安装：'+config.version),E('ul',{'class':'as-instructions'},[
       E('li',{},'r17：插件与匹配音频组件一体安装，缺失固件自动校验下载，必要时重启后继续准备。'),E('li',{},'r16：修复麦克风突发帧丢弃与上行卡顿。'),E('li',{},'r15 已撤回；保留插件兼容性、依赖和签名校验改进。'),E('li',{},'r14：自动检查更新、签名校验升级、任务进度与失败提示。'),E('li',{},'保留 r13 的连接模式、Relay、端口、脱敏诊断和版本说明。'),E('li',{},'包含 VIPME-M8 振铃 mode 3 解析修复；已有通话和短信功能保留。'),E('li',{},'U30 Air 短时局域网双向声音已人工确认；长通话、多路及其他硬件尚未验收。')])])
     ])
