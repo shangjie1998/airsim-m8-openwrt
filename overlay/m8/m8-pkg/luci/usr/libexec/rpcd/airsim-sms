@@ -6,7 +6,7 @@
 case "$1" in
 	list)
 		cat <<'JSON'
-{"sms_list":{"page":"string","card":"string"},"sms_show":{"id":"string"},"sms_send":{"num":"string","text":"string","card":"string"},"sms_job":{},"sms_sims":{}}
+{"sms_list":{"page":"string","card":"string"},"sms_show":{"id":"string"},"sms_send":{"num":"string","text":"string","card":"string"},"sms_job":{},"sms_sims":{},"sms_read_all":{},"sms_clear_batch":{"limit":"string"}}
 JSON
 		;;
 	call)

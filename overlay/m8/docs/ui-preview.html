@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M8 界面预览 · 玻璃风</title>
+<style>
+:root{
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","PingFang SC",sans-serif;
+  --ink:#1d1d1f; --ink-2:#6e6e73; --ink-3:#8e8e93;
+  --glass:rgba(255,255,255,.52); --glass-strong:rgba(255,255,255,.78);
+  --line:rgba(0,0,0,.06); --line-strong:rgba(0,0,0,.10);
+  --blue:#0071e3; --blue-press:#0077ed;
+  --green:#248040; --green-bg:rgba(52,199,89,.12);
+  --red:#b42326; --red-bg:rgba(255,59,48,.10);
+  --shadow:0 6px 24px rgba(0,0,0,.05), 0 1px 2px rgba(0,0,0,.03);
+  --radius:20px; --radius-s:12px; --blur:22px; --sat:180%;
+  --bg-a:#f5f5f7; --bg-b:#f5f5f7; --bg-c:#ececef;
+  --pad:clamp(16px,3vw,34px);
+}
+html[data-theme="dark"]{
+  --ink:#f5f5f7; --ink-2:#98989d; --ink-3:#6e6e73;
+  --glass:rgba(28,28,30,.62); --glass-strong:rgba(28,28,30,.82);
+  --line:rgba(255,255,255,.10); --line-strong:rgba(255,255,255,.16);
+  --blue:#0a84ff; --blue-press:#409cff;
+  --green:#30d158; --green-bg:rgba(48,209,88,.14);
+  --red:#ff453a; --red-bg:rgba(255,69,58,.14);
+  --shadow:0 8px 32px rgba(0,0,0,.42), 0 1px 2px rgba(0,0,0,.3);
+  --bg-a:#101013; --bg-b:#17171a; --bg-c:#0b0b0d;
+}
+html[data-motion="reduce"] *{backdrop-filter:none !important;-webkit-backdrop-filter:none !important}
+*{box-sizing:border-box}
+body{
+  margin:0;padding:var(--pad);min-height:100vh;color:var(--ink);font-family:var(--font);
+  font-size:17px;line-height:1.47;-webkit-font-smoothing:antialiased;
+  background:
+    radial-gradient(1000px 620px at 10% -10%, color-mix(in srgb,var(--blue) 9%, transparent), transparent 64%),
+    radial-gradient(820px 540px at 94% 2%, color-mix(in srgb,var(--green) 7%, transparent), transparent 62%),
+    linear-gradient(170deg,var(--bg-a),var(--bg-b) 55%,var(--bg-c));
+  background-attachment:fixed;
+}
+.wrap{max-width:1180px;margin:0 auto}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:22px}
+h1{font-size:clamp(26px,3.2vw,34px);font-weight:700;letter-spacing:-.9px;margin:0}
+.sub{color:var(--ink-2);font-size:15px;margin-top:6px}
+.seg{display:inline-flex;background:var(--glass);border:1px solid var(--line);border-radius:999px;padding:3px;backdrop-filter:blur(var(--blur)) saturate(var(--sat));-webkit-backdrop-filter:blur(var(--blur)) saturate(var(--sat))}
+.seg button{font:600 13px/1 var(--font);color:var(--ink-2);background:transparent;border:0;padding:9px 15px;border-radius:999px;cursor:pointer;min-height:36px}
+.seg button[aria-pressed="true"]{background:var(--glass-strong);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:18px;align-items:start}
+.card{
+  background:var(--glass);border:1px solid var(--line);border-radius:var(--radius);
+  padding:clamp(18px,2.4vw,26px);box-shadow:var(--shadow);
+  backdrop-filter:blur(var(--blur)) saturate(var(--sat));-webkit-backdrop-filter:blur(var(--blur)) saturate(var(--sat));
+  min-width:0;
+}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:4px}
+.card h2{font-size:22px;font-weight:650;letter-spacing:-.4px;margin:0}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:5px 11px;border-radius:999px;white-space:nowrap}
+.pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+.on{color:var(--green);background:var(--green-bg)}
+.off{color:var(--ink-3);background:color-mix(in srgb,var(--ink-3) 12%,transparent)}
+.big{margin:16px 0 6px;font-size:clamp(26px,3vw,34px);font-weight:600;letter-spacing:-.7px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.cap{color:var(--ink-2);font-size:13px;line-height:1.7}
+.row{display:flex;justify-content:space-between;gap:16px;align-items:baseline;padding:12px 0;border-bottom:1px solid var(--line);font-size:15px}
+.row:last-child{border-bottom:0}
+.row dt{color:var(--ink-2);margin:0;flex-shrink:0}
+.row dd{margin:0;text-align:right;font-weight:500;overflow-wrap:anywhere}
+.btn{font:600 15px/1.2 var(--font);min-height:44px;padding:12px 20px;border-radius:var(--radius-s);border:1px solid transparent;cursor:pointer}
+.pri{background:var(--blue);color:#fff}
+.sec{background:var(--glass-strong);color:var(--ink);border-color:var(--line-strong)}
+.dan{background:var(--red-bg);color:var(--red);border-color:color-mix(in srgb,var(--red) 30%,transparent)}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+.field{margin:16px 0}
+.field label{display:block;font-size:13px;color:var(--ink-2);margin-bottom:7px}
+.field input,.field select{width:100%;min-height:46px;font:400 17px var(--font);padding:11px 13px;border-radius:var(--radius-s);border:1px solid var(--line-strong);background:var(--glass-strong);color:var(--ink);-webkit-appearance:none;appearance:none}
+.fb{margin-top:16px;padding:13px 15px;border-radius:var(--radius-s);font-size:14px;background:color-mix(in srgb,var(--blue) 10%,transparent);border:1px solid color-mix(in srgb,var(--blue) 24%,transparent)}
+.hint{color:var(--ink-3);font-size:12px;margin-top:18px}
+@media(max-width:600px){
+  body{font-size:17px}
+  h1{font-size:26px}
+  .card h2{font-size:20px}
+  .row{display:block;padding:10px 0}
+  .row dd{text-align:left;margin-top:3px;color:var(--ink);font-size:15px}
+  .btns .btn{flex:1}
+  .bar{gap:10px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="bar">
+    <div>
+      <h1>设备概览</h1>
+      <div class="sub">VIPME-M8 · 已连接</div>
+    </div>
+    <div class="seg" role="group" aria-label="外观">
+      <button type="button" data-set="auto" aria-pressed="true">跟随系统</button>
+      <button type="button" data-set="light" aria-pressed="false">浅色</button>
+      <button type="button" data-set="dark" aria-pressed="false">深色</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <div class="card-head"><h2>通话</h2><span class="pill on">就绪</span></div>
+      <div class="big">+86 131 6677 3059</div>
+      <div class="cap">SIM1 · 中国联通 · 主卡</div>
+      <div class="btns"><button class="btn pri">拨号</button><button class="btn sec">最近通话</button></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>网络</h2><span class="pill on">已注册</span></div>
+      <dl style="margin:14px 0 0">
+        <div class="row"><dt>信号</dt><dd>-88 dBm</dd></div>
+        <div class="row"><dt>数据卡</dt><dd>SIM2 · 中国广电</dd></div>
+        <div class="row"><dt>局域网</dt><dd>192.168.9.1</dd></div>
+      </dl>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>外观</h2><span class="pill off">设置</span></div>
+      <div class="field">
+        <label for="d">界面密度</label>
+        <select id="d"><option>舒适</option><option>紧凑</option></select>
+      </div>
+      <div class="fb">深色模式跟随系统，也可以在这里手动固定。</div>
+      <div class="btns"><button class="btn sec">降低透明度</button></div>
+      <div class="hint">卡片模糊在低端浏览器上会掉帧，可关闭。</div>
+    </section>
+  </div>
+</div>
+<script>
+var root=document.documentElement, mq=matchMedia('(prefers-color-scheme: dark)'), mode='auto';
+function paint(){
+  var dark = mode==='dark' || (mode==='auto' && mq.matches);
+  root.dataset.theme = dark?'dark':'light';
+  [].forEach.call(document.querySelectorAll('.seg button'),function(b){
+    b.setAttribute('aria-pressed', b.dataset.set===mode ? 'true':'false');
+  });
+}
+[].forEach.call(document.querySelectorAll('.seg button'),function(b){
+  b.addEventListener('click',function(){ mode=b.dataset.set; paint(); });
+});
+mq.addEventListener('change',paint);
+document.querySelector('.card .btn.sec:last-of-type');
+document.querySelectorAll('.btns .btn')[3].addEventListener('click',function(){
+  root.dataset.motion = root.dataset.motion==='reduce' ? '' : 'reduce';
+});
+paint();
+</script>
+</body>
+</html>

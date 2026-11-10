@@ -71,22 +71,38 @@ mkdir -p /usr/lib/airsim
 ln -sf /opt/airsim-m8/bin/airsim-agent /usr/lib/airsim/airsim-agent
 ln -sf /opt/airsim-m8/bin/airsim-mu300d /usr/lib/airsim/airsim-mu300d
 
-say "== installing LuCI menu (AirSIM overview / manage / SMS)"
+say "== installing LuCI menu (AirSIM overview / connect / call / maintenance / settings)"
 mkdir -p /usr/libexec/rpcd /usr/share/luci/menu.d /usr/share/rpcd/acl.d \
 	/www/luci-static/resources/view/airsim /etc/config
 cp "$HERE/luci/usr/libexec/rpcd/airsim" /usr/libexec/rpcd/airsim
 cp "$HERE/luci/usr/libexec/rpcd/airsim-sms" /usr/libexec/rpcd/airsim-sms
 cp "$HERE/luci/usr/libexec/rpcd/airsim-call" /usr/libexec/rpcd/airsim-call
-chmod 755 /usr/libexec/rpcd/airsim /usr/libexec/rpcd/airsim-sms /usr/libexec/rpcd/airsim-call
+cp "$HERE/luci/usr/libexec/rpcd/airsim-bt" /usr/libexec/rpcd/airsim-bt
+chmod 755 /usr/libexec/rpcd/airsim /usr/libexec/rpcd/airsim-sms /usr/libexec/rpcd/airsim-call /usr/libexec/rpcd/airsim-bt
 cp "$HERE/luci/usr/share/luci/menu.d/luci-app-airsim.json" /usr/share/luci/menu.d/luci-app-airsim.json
 cp "$HERE/luci/usr/share/rpcd/acl.d/luci-app-airsim.json" /usr/share/rpcd/acl.d/luci-app-airsim.json
 chmod 644 /usr/share/luci/menu.d/luci-app-airsim.json /usr/share/rpcd/acl.d/luci-app-airsim.json
-for f in overview.js manage.js sms.js call.js overview.css; do
+for f in overview.js connect.js maintenance.js sms.js call.js ui.css ui.js settings.js; do
 	cp "$HERE/luci/www/luci-static/resources/view/airsim/$f" "/www/luci-static/resources/view/airsim/$f"
 	chmod 644 "/www/luci-static/resources/view/airsim/$f"
 done
 cp "$HERE/luci/opt/airsim-m8/bin/sms-dash.py" /opt/airsim-m8/bin/sms-dash.py
 chmod 755 /opt/airsim-m8/bin/sms-dash.py
+cp "$HERE/luci/opt/airsim-m8/bin/airsim-bt.py" /opt/airsim-m8/bin/airsim-bt.py
+chmod 755 /opt/airsim-m8/bin/airsim-bt.py
+# M8 专用：出厂 btmac 全 0 时蓝牙核没有一个合法地址，vendor 的地址回收脚本又依赖
+# 本机不存在的 /mnt/e5-data，于是 e5-bt 直接起不来。这个脚本只在地址是全 0 / 全 ff /
+# 组播时动手，先备份再改；已经是合法地址就什么都不做，可以放心每次都跑。
+cp "$HERE/luci/opt/airsim-m8/bin/m8-bt-address-fix.py" /opt/airsim-m8/bin/m8-bt-address-fix.py
+chmod 755 /opt/airsim-m8/bin/m8-bt-address-fix.py
+if [ -x /opt/airsim-m8/bin/m8-bt-address-fix.py ] && [ -w /lib/firmware/sprd/marlin3lite_pskey.bin ]; then
+	/opt/airsim-m8/bin/m8-bt-address-fix.py || say "   BT address fix skipped (unexpected PSKEY layout)"
+fi
+# 蓝牙开关的机型差异全在这份配置里；已经改过的不覆盖（F50 装同一份代码、换一份配置）
+if [ ! -f /etc/config/airsim-bt ]; then
+	cp "$HERE/luci/etc/config/airsim-bt" /etc/config/airsim-bt
+	chmod 644 /etc/config/airsim-bt
+fi
 cp "$HERE/luci/etc/config/airsim" /etc/config/airsim
 /etc/init.d/rpcd restart >/dev/null 2>&1 || true
 
@@ -141,7 +157,7 @@ curl -s --max-time 4 http://127.0.0.1:7581/status | tr ',' '\n' | grep -E 'audio
 say "== agent health"
 curl -s --max-time 4 http://127.0.0.1:8575/api/health || say "(Agent not reachable yet)"
 say "== ubus objects"
-ubus list 2>/dev/null | grep -E '^(airsim|airsim-sms)$' || true
+ubus list 2>/dev/null | grep -E '^(airsim|airsim-sms|airsim-call|airsim-bt)$' || true
 say ""
 say "Installed. Remove everything with: sh /opt/airsim-m8/uninstall.sh"
 say "PCM endpoint for AirSIM clients: tcp $LAN:8582"

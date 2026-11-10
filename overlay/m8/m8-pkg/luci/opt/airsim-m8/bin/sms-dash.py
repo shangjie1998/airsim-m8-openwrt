@@ -233,8 +233,52 @@ def do_job():
     return {"ok": True, "none": True}
 
 
+def do_read_all():
+    """把当前所有收件短信在本地面板上标成已读；不动 SIM 卡里的短信本体。"""
+    st = state()
+    marked = 0
+    for m in messages():
+        if (m.get("direction") or "in") == "out":
+            continue
+        sid = str(m.get("id"))
+        if sid not in st["read"]:
+            st["read"].append(sid)
+            marked += 1
+    st["read"] = st["read"][-500:]
+    save_state(st)
+    return {"ok": True, "marked": marked}
+
+
+def do_clear_batch():
+    """分批真删：e5-sms 只有单条 delete，一次删太多会被 rpc 超时掐断。"""
+    a = read_args()
+    try:
+        limit = max(1, min(10, int(str(a.get("limit") or "4"))))
+    except ValueError:
+        limit = 4
+    st = state()
+    items = messages()
+    deleted, failed = 0, 0
+    for m in items[:limit]:
+        sid = str(m.get("id"))
+        if not sid.isdigit():
+            failed += 1
+            continue
+        try:
+            e5("delete", sid, timeout=20)
+            deleted += 1
+            if sid in st["read"]:
+                st["read"].remove(sid)
+        except Exception:
+            failed += 1
+    save_state(st)
+    remaining = len(messages())
+    return {"ok": True, "deleted": deleted, "failed": failed, "remaining": remaining}
+
+
 METHODS = {"sms_list": do_list, "sms_show": do_show, "sms_send": do_send,
-           "sms_job": do_job, "sms_sims": do_sims}
+           "sms_job": do_job, "sms_sims": do_sims,
+           "sms_read_all": do_read_all, "sms_clear_batch": do_clear_batch}
 
 if __name__ == "__main__":
     name = sys.argv[1] if len(sys.argv) > 1 else ""

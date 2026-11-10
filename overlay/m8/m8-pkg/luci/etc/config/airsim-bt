@@ -1,0 +1,18 @@
+# AirSIM 蓝牙开关 —— 机型差异只写在这里，代码不用改。
+#
+# backend=service：开关交给现成的 init 脚本（M8 是 vendor 的 e5-bt）
+# backend=attach ：自己 modprobe + rfkill 解锁 + btattach（F50 这种没 vendor 服务的用这个）
+#
+# F50 照抄一份，只把 service / tty / module / flag_uci 换成自己的即可。
+
+config main 'main'
+	option label '蓝牙'
+	option backend 'service'
+	option service 'e5-bt'
+	option flag_uci 'e5-bluetooth.main.enabled'
+	option autostart_uci 'e5-bluetooth.main.autostart'
+	option power_on '1'
+	option tty '/dev/ttyBT0'
+	option baud '3000000'
+	option module 'sprdbt_tty'
+	option adapter 'hci0'

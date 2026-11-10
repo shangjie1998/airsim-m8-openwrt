@@ -1,0 +1,17 @@
+#!/bin/sh
+# airsim-bt: Bluetooth switch for the AirSIM panel.
+# Generic by design: the machine-specific bits (which init script, which uci key,
+# which tty) live in /etc/config/airsim-bt, so M8 and F50 share this same file.
+case "$1" in
+	list)
+		cat <<'JSON'
+{"bt_get":{},"bt_set":{"enable":"string"}}
+JSON
+		;;
+	call)
+		exec /usr/bin/python3 /opt/airsim-m8/bin/airsim-bt.py "$2"
+		;;
+	*)
+		exit 1
+		;;
+esac

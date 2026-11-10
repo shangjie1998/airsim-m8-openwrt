@@ -1,7 +1,8 @@
 'use strict';
-'require baseclass';
+'require view';
 'require rpc';
 'require poll';
+'require view.airsim.ui as ui';
 
 // Use the firmware's two-SIM inbox and its per-card submit path, never the Agent's
 // text-mode SMS API: the Agent relays AT through mmcli and only ever sees the
@@ -11,10 +12,17 @@ var showSMS = rpc.declare({ object: 'airsim-sms', method: 'sms_show', params: ['
 var sendSMS = rpc.declare({ object: 'airsim-sms', method: 'sms_send', params: ['num', 'text', 'card'], expect: {}, reject: true, nobatch: true });
 var getJob = rpc.declare({ object: 'airsim-sms', method: 'sms_job', expect: {}, reject: true, nobatch: true });
 var getSims = rpc.declare({ object: 'airsim-sms', method: 'sms_sims', expect: {}, reject: true, nobatch: true });
+var markAllRead = rpc.declare({ object: 'airsim-sms', method: 'sms_read_all', expect: {}, reject: true, nobatch: true });
+var clearBatch = rpc.declare({ object: 'airsim-sms', method: 'sms_clear_batch', params: ['limit'], expect: {}, reject: true, nobatch: true });
+var getStatus = rpc.declare({ object: 'airsim', method: 'status', expect: {} });
 
-return baseclass.extend({
- render: function() {
+return view.extend({
+ load: function() { return getStatus().catch(function() { return {}; }); },
+ render: function(data) {
+  ui.install();
+  var state = data || {};
   var page = 1, pages = 1, loading = false, reading = false, checking = false;
+  var clearing = false, marking = false;
   var sending = false, running = false, jobKnown = false, watching = false, uncertain = false;
   var lastList = 0, signature = '', draft = null, selected = '';
   var filterCard = '', sendCard = '0', sendCardInit = false, simState = null;
@@ -41,6 +49,8 @@ return baseclass.extend({
    counter.textContent = body.value.length + ' / 70 字';
    previous.disabled = loading || page <= 1; next.disabled = loading || page >= pages;
    refresh.disabled = loading;
+   markReadAll.disabled = loading || marking || clearing;
+   clearAll.disabled = loading || marking || clearing;
   }
   async function refreshList() {
    if (loading) return;
@@ -205,13 +215,61 @@ return baseclass.extend({
   var previous = button('上一页', function() { if (previous.disabled) return; page--; signature = ''; return refreshList(); });
   var next = button('下一页', function() { if (next.disabled) return; page++; signature = ''; return refreshList(); });
   var refresh = button('刷新短信', refreshList, 'as-text-button');
+  var markReadAll = button('全部已读', function() { return markEverything(); }, 'as-secondary');
+  var clearAll = button('清空短信', function() { return clearEverything(); }, 'as-danger');
+  var opsNote = E('p', { 'class': 'as-feedback', role: 'status', 'aria-live': 'polite', hidden: true });
+  function opMessage(kind, text) {
+   if (!text) { opsNote.hidden = true; return; }
+   opsNote.hidden = false;
+   opsNote.className = 'as-feedback as-feedback-' + kind;
+   opsNote.textContent = text;
+  }
+  // 本地已读标记，不碰 SIM 卡：设备端只把这几条 id 记下来，列表里就不再显示未读。
+  async function markEverything() {
+   if (marking || clearing || loading) return;
+   marking = true; update(); opMessage('pending', '正在把未读短信标成已读…');
+   try {
+    var result = await markAllRead();
+    if (!result || result.error) throw new Error((result && result.error) || '标记失败');
+    opMessage('success', '已标记 ' + (Number(result.marked) || 0) + ' 条为已读。');
+    signature = ''; await refreshList();
+   } catch (e) { opMessage('error', '标记已读失败：' + (e.message || '请稍后重试') + '。'); }
+   finally { marking = false; update(); }
+  }
+  // 清空是逐条真删（固件 e5-sms 只有单条删除），所以分批做、边删边报进度，
+  // 避免一次请求耗时太长被 20 秒的 rpc 超时掐断。
+  async function clearEverything() {
+   if (clearing || marking || loading) return;
+   var go = await ui.dialog('清空全部短信？', '会把两张卡里收、发的短信从设备上删掉，删了之后找不回来。只清列表里的未读标记不受影响。', { danger: true, okText: '确认清空' });
+   if (!go) return;
+   clearing = true; update();
+   var deleted = 0, round = 0;
+   opMessage('pending', '正在清空短信…');
+   try {
+    while (round++ < 60) {
+     var result = await clearBatch('4');
+     if (!result || result.error) throw new Error((result && result.error) || '删除失败');
+     deleted += Number(result.deleted) || 0;
+     var remaining = Number(result.remaining) || 0;
+     opMessage('pending', '已删 ' + deleted + ' 条，还剩 ' + remaining + ' 条…');
+     if (!remaining) break;
+    }
+    opMessage('success', '已清空短信，共删除 ' + deleted + ' 条。');
+    page = 1; signature = ''; await refreshList();
+   } catch (e) {
+    opMessage('error', '清空中断了：' + (e.message || '请稍后重试') + '。已删 ' + deleted + ' 条，可以再点一次接着清。');
+    signature = ''; await refreshList();
+   } finally { clearing = false; update(); }
+  }
   var close = button('收起全文', function() { selected = ''; full.hidden = true; fullBody.textContent = ''; }, 'as-text-button');
   full.appendChild(close);
-  var root = E('section', { 'class': 'as-card as-sms', 'aria-label': '短信' }, [
+  var card = E('section', { 'class': 'as-card as-sms', 'aria-label': '短信' }, [
    E('div', { 'class': 'as-card-heading' }, [E('h3', {}, '短信'), count]),
    E('p', { 'class': 'as-copy' }, '查看与发送 VIPME-M8 两张 SIM 卡的短信。'),
    simsInfo,
    E('div', { 'class': 'as-sms-toolbar' }, [E('label', { 'for': 'as-sms-filter', 'class': 'as-field-label' }, '查看卡'), filterSelect, refresh]),
+   E('div', { 'class': 'as-buttons as-sms-ops' }, [markReadAll, clearAll]),
+   opsNote,
    listHint, list, E('div', { 'class': 'as-buttons as-sms-pages' }, [previous, next]), full,
    E('div', { 'class': 'as-sms-compose' }, [
     E('h4', {}, '新短信'),
@@ -222,10 +280,19 @@ return baseclass.extend({
     E('div', { 'class': 'as-buttons' }, [send]), confirmation, feedback, ack
    ])
   ]);
+  var rootEl = E('div', { 'class': 'as-root' }, [
+   ui.stylesheet(),
+   E('header', { 'class': 'as-header' }, [
+    E('div', {}, [E('div', { 'class': 'as-eyebrow' }, 'AirSIM · 短信'), E('h2', {}, '短信，两张卡一页管。'), E('p', {}, '查看、标记已读、清空与发送 VIPME-M8 两张 SIM 卡的短信。')]),
+    E('span', { 'class': 'as-version' }, state && state.version ? 'v' + state.version : '')
+   ]),
+   E('div', { 'class': 'as-layout' }, [card]),
+   E('footer', { 'class': 'as-footer' }, 'AirSIM for VIPME-M8 · 短信')
+  ]);
   update(); loadSims(); refreshList(); checkJob();
   poll.add(function() {
    return Promise.all([checkJob(), Date.now() - lastList >= 10000 ? refreshList() : Promise.resolve()]);
   }, 2);
-  return root;
+  return rootEl;
  }
 });

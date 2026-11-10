@@ -2,7 +2,7 @@
 'require view';
 'require rpc';
 'require poll';
-'require view.airsim.sms as sms';
+'require view.airsim.ui as ui';
 
 var getStatus = rpc.declare({ object: 'airsim', method: 'status', expect: {} });
 var callAction = rpc.declare({ object: 'airsim', method: 'call_action', params: ['action', 'number', 'call_id', 'operation_id', 'card'], expect: {}, reject: true, nobatch: true });
@@ -141,6 +141,7 @@ function pairStepDone(box, result) {
 return view.extend({
  load: function() { return getStatus(); },
  render: function(data) {
+  ui.install();
   var current = data || {}, pending = '', previousVersion = '', callOptions = '', dialAttempt = null, simsState = null;
   var root, nodes = {}, buttons = {};
   function text(key, tag, className, content) {
@@ -360,7 +361,7 @@ return view.extend({
    } catch (_) { simsLine.textContent = '两张 SIM 卡信息读取失败，拨出卡按 SIM1/SIM2 选择。'; }
   }
   root = E('div', { 'class': 'as-root' }, [
-   E('link', { 'rel': 'stylesheet', 'href': L.resource('view/airsim/overview.css') }),
+   ui.stylesheet(),
    E('header', { 'class': 'as-header' }, [E('div', {}, [E('div', { 'class': 'as-eyebrow' }, 'AirSIM · 电话网关'), E('h2', {}, '让连接，简单一点。'), E('p', {}, 'VIPME-M8 的运行状态与客户端连接，在这里管理。')]), text('version', 'span', 'as-version')]),
    E('div', { 'class': 'as-layout' }, [
     E('section', { 'class': 'as-card as-status', 'aria-label': '设备状态' }, [
@@ -396,8 +397,7 @@ return view.extend({
      E('label', { 'for': 'as-call-select', 'class': 'as-field-label' }, '选择通话'), nodes.callSelect,
      E('div', { 'class': 'as-buttons' }, [button('接听', 'answer', 'as-primary'), button('挂断', 'hangup', 'as-danger')]),
      nodes.callFeedback
-    ]),
-    sms.render()
+    ])
    ]),
    E('footer', { 'class': 'as-footer' }, 'AirSIM for VIPME-M8 · 开发预览版')
   ]);

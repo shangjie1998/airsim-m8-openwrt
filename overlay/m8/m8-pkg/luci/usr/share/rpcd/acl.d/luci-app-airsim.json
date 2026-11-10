@@ -20,6 +20,9 @@
      "sms_show",
      "sms_job",
      "sms_sims"
+    ],
+    "airsim-bt": [
+     "bt_get"
     ]
    }
   },
@@ -44,12 +47,17 @@
      "sms_show",
      "sms_send",
      "sms_job",
-     "sms_sims"
+     "sms_sims",
+     "sms_read_all",
+     "sms_clear_batch"
     ],
     "airsim-call": [
      "call_save",
      "call_test",
      "call_clear"
+    ],
+    "airsim-bt": [
+     "bt_set"
     ]
    }
   }

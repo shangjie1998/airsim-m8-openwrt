@@ -9,7 +9,7 @@
 
 - 上游项目：[kai-wu-cortex/airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)
 - 本适配仓库：<https://github.com/shangjie1998/airsim-m8-openwrt>
-- 当前已验收版本：**`0.1.0.26-r22-m8`**（详见 [版本口径](#版本口径)）
+- 当前已验收版本：**`0.1.0.32-r22-m8`**（详见 [版本口径](#版本口径)）
 
 > 感谢上游作者 **kai-wu-cortex** 开源 [airsim-mu300](https://github.com/kai-wu-cortex/airsim-mu300)。
 > 本仓库的 daemon、Agent、LuCI 页面、AirSIM 协议实现全部来自上游；这里做的是"让同一套东西在
@@ -244,12 +244,12 @@ scts: <SCTS 时间串>
 
 ```sh
 # 1. 把安装包传到设备 /tmp（scp 直写系统路径会失败，必须先落 /tmp）
-scp "airsim-m8-0.1.0.26-r22-m8.tar.gz" root@192.168.9.1:/tmp/
+scp "airsim-m8-0.1.0.32-r22-m8.tar.gz" root@192.168.9.1:/tmp/
 
 # 2. 设备侧解包安装
 ssh root@192.168.9.1
 mkdir -p /tmp/m8pkg && cd /tmp/m8pkg
-tar xzf "/tmp/airsim-m8-0.1.0.26-r22-m8.tar.gz" -C /tmp/m8pkg
+tar xzf "/tmp/airsim-m8-0.1.0.32-r22-m8.tar.gz" -C /tmp/m8pkg
 sh install.sh
 ```
 
@@ -348,6 +348,42 @@ daemon `/status.version` 与 Agent `version`（`0.4.7-mu300.<VERSION>`）同串�
 ---
 
 ## 8.1 版本更新说明
+
+### v0.1.0.32-r22-m8（2026-11-09）
+
+**做了什么**
+
+- 网页界面整体换成苹果玻璃风设计系统：浅色底 `#F5F5F7`、玻璃卡、圆角 20/12、按钮蓝 `#0071E3`，
+  深色底 `#101013`；支持「跟随系统 / 浅色 / 深色」三态 + 界面密度 + 卡片背景（玻璃 / 纯色）。
+  视觉只由 `view/airsim/ui.css` 与 `ui.js` 一份真源决定，六个页面全部走它。
+- 原「管理与维护」一页拆成 **设备概览 / 连接 / 来电通知 / 短信 / 维护 / 设置** 六项菜单；
+  顶部标签栏 `position:sticky` 吸顶，长页滚动时一直能切页。
+- 短信独立成页：新增「全部已读」（只动本机标记，不碰 SIM）与「清空短信」
+  （红框二次确认，分批调用固件 `e5-sms delete`，`limit` 1–10 默认 4，避开 20 秒 rpc 超时）。
+- 设置页新增**蓝牙开关**（见下），号码输入框统一 `type="tel"`，移动端弹出数字键盘。
+- 来电通知页去掉对设备上 vendor 共享模块（178 KB）的依赖，改为自渲染，换固件不再白屏。
+
+**蓝牙开关（通用实现，M8 / F50 共用一套代码）**
+
+- 后端 `airsim-bt.py` + rpcd 对象 `airsim-bt`，方法 `bt_get` / `bt_set{enable}`。
+- 机型差异**只写在 `/etc/config/airsim-bt`**：M8 用 `backend=service`、`service=e5-bt`、
+  `flag_uci=e5-bluetooth.main.enabled`；F50 这类没有 vendor 服务的机型改成 `backend=attach`，
+  脚本自己 `modprobe` + `rfkill` 解锁 + `btattach`。前端同一张卡，配置缺失时整张卡自动不显示。
+- 顺带修掉本机一个硬伤：出厂 btmac 为全 0，vendor 的地址回收脚本依赖本机不存在的
+  `/mnt/e5-data`，导致 `e5-bt` 根本起不来（`Address not available (99)`）。新增
+  `m8-bt-address-fix.py`（**仅 M8 用，F50 不要装**）给 PSKEY 补一个本地管理地址
+  `02:50:00:00:E5:02`，改前自动备份，地址合法时什么都不做，装机时自动跑一遍。
+
+真机验证：
+
+```
+装包后 daemon 0.1.0.32-r22-m8、Agent 0.4.7-mu300.0.1.0.32-r22-m8，服务 running
+菜单 6 项：设备概览 | 连接 | 来电通知 | 短信 | 维护 | 设置（旧菜单缓存需清 sessionStorage）
+浅/深色切换即时生效；390px 窄屏无横向溢出；滚动 900px 处 tabmenu 仍 sticky 在 top=56
+短信「全部已读」：未读 1 → 0，后端返回 {"ok":true,"marked":1}
+蓝牙：bt_set 关 3 秒返回 attached=false；开 7 秒返回 attached=true、up=true，
+      hciconfig 显示 UP RUNNING / BD Address 02:50:00:00:E5:02，Wi-Fi 与 br-lan 未受影响
+```
 
 ### v0.1.0.31-r22-m8（2026-11-09）
 

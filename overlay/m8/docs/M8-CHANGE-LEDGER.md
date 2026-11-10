@@ -70,6 +70,36 @@
 | G3 | `docs/PENDING-cloud-dial-missing-sim-account.md` | 云端拨号缺 `sim_account` 的排查记录 | ⏸ 挂起 |
 | G4 | `docs/UPSTREAM_README.md` | 上游 README 原文存档（根 `README-M8.md` 是自建版） | ✅ |
 | G5 | `README.md`（overlay 覆盖上游同名文件） | 改成 M8 自建说明 | ✅ |
+| G6 | `docs/ui-preview.html` | 玻璃风界面离线预览（三态外观可点、手机/平板/电脑三档），定稿视觉的参照物 | ✅ |
+
+## 六、界面：玻璃风设计系统（批次 1）
+
+| ID | 文件 | 改了什么 | 为什么 | 状态 |
+|---|---|---|---|---|
+| U1 | `ui.css`（新增） | 设计系统：浅/深两套 token（浅色底 `#F5F5F7`、玻璃卡 `.52`、实体控件 `.78`；深色 `#101013`）+ 卡片/按钮/字段/行/药丸/反馈/分段控件/弹层/拖拽区/短信块，全部带三档响应式 | 原来 `overview.css` 一根大杂烩，每加功能往里追加，同一组件在不同页长得不一样 | ✅ 装机后概览与设置页正常 |
+| U2 | `ui.js`（新增） | 外观状态机：`auto`/`light`/`dark` 三态 + 密度 + 透明度，写 `localStorage`，`auto` 监听 `prefers-color-scheme`；`install()` 幂等套用 | 深色要能跟随系统又要能手动定，三页都要认，不能各写一份 | ✅ 切换即时生效、刷新记住 |
+| U3 | `settings.js`（新增） | 设置页：外观三选一、密度、卡片背景（玻璃/纯色）、关于（版本 + 设备尾号） | 用户要求把颜色这类偏好单独放一页 | ✅ |
+| U4 | `overview.js` | 只换样式来源：`overview.css` → `ui.css`，`render` 开头调 `ui.install()`；rpc 逻辑一行未动 | 让概览先吃到新系统 | ✅ 数据与改前一致 |
+| U5 | `m8-pkg/luci/usr/share/luci/menu.d/luci-app-airsim.json` | 新增「设置」菜单项（order 40 → `airsim/settings`） | 新页面要能点进去 | ✅ |
+| U6 | `m8-pkg/install.sh` | 拷贝列表加 `ui.css`、`ui.js`、`settings.js` | 漏一个就是白屏或 404 | ✅ |
+
+| U7 | `connect.js`（新增） | 「连接」页：连接模式、Relay 地址（含官方默认/跟随客户端两个快捷键）、LAN 接口、三个端口、运行状态、保存 | 原来连接设置和备份更新挤在同一页，改一个连接模式还得翻半屏 | ✅ |
+| U8 | `maintenance.js`（新增） | 「维护」页：备份与恢复（拖拽 + 指纹校验 + 二次确认）、插件更新（自动检查 / 预览版 / 整包发布提示）、脱敏诊断、版本说明 | 同上，维护类操作单独成页 | ✅ |
+| U9 | `call.js`（重写） | 「来电通知」页改为自渲染：去掉 `require mu300.common`，确认框/轻提示/忙碌态改用 `ui.js` 的实现，样式全走 `ui.css`；rpc 与取值逻辑原样保留 | 这是唯一一页依赖设备上 vendor 的 178 KB 共享模块，换固件就可能白屏 | ✅ |
+| U10 | `m8-pkg/luci/usr/share/luci/menu.d/luci-app-airsim.json` | 菜单重排为 设备概览(10) / 连接(20) / 来电通知(30) / 维护(40) / 设置(50) | 拆页后入口要对上 | ✅ |
+| U11 | `install.sh` | 拷贝列表改为 `overview.js connect.js maintenance.js sms.js call.js ui.css ui.js settings.js` | 新页不装就是 404 | ✅ |
+| U12 | 删除 `manage.js`、`overview.css` | 旧合并页由 connect + maintenance 接管；`overview.css` 已无人引用（三页全走 `ui.css`） | 留两份样式就是下次打架的源头 | ✅ |
+
+## 七、界面：拆页收尾（批次 3）
+
+| ID | 文件 | 改了什么 | 为什么 | 状态 |
+|---|---|---|---|---|
+| U13 | `sms.js` | 由 `baseclass` 子视图改独立 view：自带 `as-root`/页面头/页脚/版本胶囊，样式走 `ui.css`；新增「全部已读」「清空短信」两个按钮 + 操作提示条 + `marking`/`clearing` 双锁；`clearEverything()` 先弹 `ui.dialog` 红色二次确认 | 短信不再塞在概览里，手机上少滚一屏；批量操作需要明确入口 | ✅ 真机验收：列表/已读计数/二次确认均正常 |
+| U14 | `overview.js` | 去掉 `require view.airsim.sms` 与布局里的 `sms.render()` | 短信独立成页后概览重复 | ✅ 概览四张卡（设备状态/启动服务/配对/拨号）正常，无短信卡 |
+| U15 | `m8-pkg/luci/opt/airsim-m8/bin/sms-dash.py`、`m8-pkg/luci/usr/libexec/rpcd/airsim-sms`、`m8-pkg/luci/usr/share/rpcd/acl.d/luci-app-airsim.json` | 后端加 `sms_read_all`（本地面板标记全部已读，不碰 SIM）与 `sms_clear_batch`（`limit` 1–10，默认 4，逐条 `e5-sms delete` 分批真删，同步剔除已读标记）；rpcd 声明补两方法；ACL write 白名单放行 | 固件 `e5-sms` 只有单条 `delete`，一次删太多会被 20 秒 rpc 超时掐断 | 🟡 `sms_read_all` 实测 `{"ok":true,"marked":N}`；`sms_clear_batch` 代码已装未实删（设备上只剩真实短信，未拿它试删） |
+| U16 | `ui.css` | 追加 `#tabmenu{position:sticky;top:56px;z-index:24}` + 玻璃背景 + blur，及 `.as-sms-ops` | 长页滚动时菜单跟着走，不用回顶 | ✅ 滚动 900px 处实测 `tabtop=56 pos=sticky`，窄屏 390px 也钉住 |
+| U17 | `ui.js` | `stylesheet()` 的 href 末尾拼 `?v=<CSSVERSION>`（当前 `20261109`） | `L.resource()` 只带固件版本，固件不变时改 CSS 浏览器一直吃旧缓存 | ✅ 改一次 CSS 必须同步改这个常量，已写进经验文档 |
+| U18 | `m8-pkg/luci/usr/share/luci/menu.d/luci-app-airsim.json` | 插入 `admin/services/airsim/sms`（order 35） | 短信页要能点进去 | ✅ 菜单 6 项：设备概览\|连接\|来电通知\|短信\|维护\|设置 |
 
 ## 六、没修好 / 做不通 / 挂起的（对外必须如实写）
 
@@ -82,3 +112,19 @@
 | P5 | 中继延迟 | 走的是作者的上游中继（境外云），跨境延迟属外部条件，自有服务器后再比方案 | ⏸ 等自有服务器 |
 | P6 | 既有 Go 单测 5 条红 | 与 M8 改动无关，未处理 | ❌ 已知 |
 | P7 | 设备重新配对 | 0.1.0.31 装机后 `configured` 仍需 iPhone 端重配 | ⏸ 待用户操作 |
+
+## 八、蓝牙开关（批次 4，通用实现）
+
+| ID | 文件 | 改了什么 | 为什么 | 状态 |
+|---|---|---|---|---|
+| U19 | `m8-pkg/luci/opt/airsim-m8/bin/airsim-bt.py`（新增） | 通用蓝牙后端：`bt_get` / `bt_set`。逻辑全在 python，机型差异只从 `/etc/config/airsim-bt` 读（backend / service / flag_uci / autostart_uci / power_on / tty / baud / module / adapter / label）。`backend=service` 交给现成 init 脚本；`backend=attach` 自己 modprobe + rfkill 解锁 + btattach。开：写 uci + start + 补 `hciconfig up`；关：先 `bluetoothctl power off` 再 stop 再 `killall btattach` | 用户要 M8 和 F50 共用同一份代码、F50 只改配置；F50 是单卡但框架相同 | ✅ 真机：关 → 3 s 返回 `attached=false`；开 → 7 s 返回 `attached=true, up=true` |
+| U20 | `m8-pkg/luci/usr/libexec/rpcd/airsim-bt`（新增）、`m8-pkg/luci/etc/config/airsim-bt`（新增） | rpcd shim 声明 `bt_get` / `bt_set({enable})` 并转 python；配置默认值按 M8 写（`service=e5-bt`、`flag_uci=e5-bluetooth.main.enabled`、`tty=/dev/ttyBT0`、`baud=3000000`、`module=sprdbt_tty`）。配置节必须是**具名节** `config main 'main'`，匿名节 `uci get airsim-bt.main` 取不到 | rpcd 对象要能被 ubus 调；机型差异单列一份文件，F50 换配置即可 | ✅ `ubus list` 出现 `airsim-bt`，`ubus call` 正常 |
+| U21 | `m8-pkg/luci/www/luci-static/resources/view/airsim/settings.js`、`m8-pkg/luci/usr/share/rpcd/acl.d/luci-app-airsim.json`、`m8-pkg/install.sh` | 设置页加「蓝牙」卡：开/关分段控件 + 状态说明 + 控制器/服务两行；`bt.supported === false` 时整张卡不出现；控制器那行做成活节点，开关一动跟着改。ACL 加 read `bt_get` / write `bt_set`；install.sh 拷 `airsim-bt` shim、`airsim-bt.py`、`/etc/config/airsim-bt`（后者已存在就不覆盖） | 开关要有入口；F50 装同一份包、换一份配置就有开关，装错机型也不会误显示 | ✅ 浏览器实测：开 → 关 → 开 均生效，`hci0 UP RUNNING`、`bluetoothctl` 能列出控制器，`br-lan` 与 Wi-Fi 未受影响 |
+
+| U22 | `m8-pkg/luci/opt/airsim-m8/bin/m8-bt-address-fix.py`（新增，M8 专用）、`m8-pkg/install.sh` | 出厂 btmac 全 0 时给 PSKEY 补一个本地管理地址；install.sh 拷到 `/opt/airsim-m8/bin/` 并**每次装机跑一遍**（合法地址时脚本自己不动手，改前备份 `…pskey.bin.bak-<old>`） | 重刷固件后厂标还是全 0，vendor 的 `m8-bluetooth-address` 又依赖本机不存在的 `/mnt/e5-data`，不补这一步蓝牙永远起不来。文件头已标注「仅 VIPME-M8，F50 不要装」 | ✅ 本机执行过：`address repaired: 00:00:00:00:00:00 -> 02:50:00:00:e5:02` |
+
+### 设备侧修复记录（重刷会复现，现已随包装自动补）
+
+- 现象：`/etc/init.d/e5-bt start` 直接失败，`hciconfig hci0 up` 报 `Can't init device hci0: Address not available (99)`，`BD Address: 00:00:00:00:00:00`。根因是 `/usr/libexec/m8-bluetooth-address` 在 `/mnt/e5-data/misc/bluedroid/bt_config.conf` 缺失时抛 `ValueError`，而本机 `/mnt/e5-data` 整个不存在（厂标地址为全 0）。
+- 处理：给 `/lib/firmware/sprd/marlin3lite_pskey.bin` 偏移 20 的 6 字节补一个本地管理地址 `02:50:00:00:e5:02`（= `br-lan` 末字节 +1），改前备份 `…pskey.bin.bak-000000000000`，改完 fsync。
+- 结果：`e5-bt start` 正常，`hci0 UP RUNNING`；Wi-Fi/`br-lan` 未受影响。**重刷固件或恢复厂标后需要重做这一步。**
