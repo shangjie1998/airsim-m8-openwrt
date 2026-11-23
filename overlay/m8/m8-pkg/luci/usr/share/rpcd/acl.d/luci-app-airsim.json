@@ -23,6 +23,16 @@
     ],
     "airsim-bt": [
      "bt_get"
+    ],
+    "airsim-net": [
+     "probe",
+     "screen",
+     "status",
+     "wifi_scan",
+     "wifi_saved",
+     "flowfix_check",
+     "admin_status",
+     "direct_status"
     ]
    }
   },
@@ -58,6 +68,13 @@
     ],
     "airsim-bt": [
      "bt_set"
+    ],
+    "airsim-net": [
+     "mode_set",
+     "wifi_connect",
+     "wifi_forget",
+     "flowfix_fix",
+     "admin_set"
     ]
    }
   }

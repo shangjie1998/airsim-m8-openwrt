@@ -78,11 +78,17 @@ cp "$HERE/luci/usr/libexec/rpcd/airsim" /usr/libexec/rpcd/airsim
 cp "$HERE/luci/usr/libexec/rpcd/airsim-sms" /usr/libexec/rpcd/airsim-sms
 cp "$HERE/luci/usr/libexec/rpcd/airsim-call" /usr/libexec/rpcd/airsim-call
 cp "$HERE/luci/usr/libexec/rpcd/airsim-bt" /usr/libexec/rpcd/airsim-bt
-chmod 755 /usr/libexec/rpcd/airsim /usr/libexec/rpcd/airsim-sms /usr/libexec/rpcd/airsim-call /usr/libexec/rpcd/airsim-bt
+cp "$HERE/luci/usr/libexec/rpcd/airsim-net" /usr/libexec/rpcd/airsim-net
+chmod 755 /usr/libexec/rpcd/airsim /usr/libexec/rpcd/airsim-sms /usr/libexec/rpcd/airsim-call /usr/libexec/rpcd/airsim-bt /usr/libexec/rpcd/airsim-net
+# 联网页后端：模式切换脚本 + 只读探测 + flowtable 体检（6.18 内核自动 skip）
+cp "$HERE/luci/usr/bin/airsim-netmode" /usr/bin/airsim-netmode
+cp "$HERE/luci/usr/libexec/airsim-net-probe" /usr/libexec/airsim-net-probe
+cp "$HERE/luci/usr/libexec/airsim-flowfix" /usr/libexec/airsim-flowfix
+chmod 755 /usr/bin/airsim-netmode /usr/libexec/airsim-net-probe /usr/libexec/airsim-flowfix
 cp "$HERE/luci/usr/share/luci/menu.d/luci-app-airsim.json" /usr/share/luci/menu.d/luci-app-airsim.json
 cp "$HERE/luci/usr/share/rpcd/acl.d/luci-app-airsim.json" /usr/share/rpcd/acl.d/luci-app-airsim.json
 chmod 644 /usr/share/luci/menu.d/luci-app-airsim.json /usr/share/rpcd/acl.d/luci-app-airsim.json
-for f in overview.js connect.js maintenance.js sms.js call.js ui.css ui.js settings.js; do
+for f in overview.js connect.js net.js maintenance.js sms.js call.js ui.css ui.js settings.js glass.js; do
 	cp "$HERE/luci/www/luci-static/resources/view/airsim/$f" "/www/luci-static/resources/view/airsim/$f"
 	chmod 644 "/www/luci-static/resources/view/airsim/$f"
 done
@@ -157,7 +163,7 @@ curl -s --max-time 4 http://127.0.0.1:7581/status | tr ',' '\n' | grep -E 'audio
 say "== agent health"
 curl -s --max-time 4 http://127.0.0.1:8575/api/health || say "(Agent not reachable yet)"
 say "== ubus objects"
-ubus list 2>/dev/null | grep -E '^(airsim|airsim-sms|airsim-call|airsim-bt)$' || true
+ubus list 2>/dev/null | grep -E '^(airsim|airsim-sms|airsim-call|airsim-bt|airsim-net)$' || true
 say ""
 say "Installed. Remove everything with: sh /opt/airsim-m8/uninstall.sh"
 say "PCM endpoint for AirSIM clients: tcp $LAN:8582"

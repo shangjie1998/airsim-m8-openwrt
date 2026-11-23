@@ -3,6 +3,7 @@
 'require poll';
 'require rpc';
 'require view.airsim.ui as ui';
+'require view.airsim.glass as glass';
 
 var getSettings = rpc.declare({ object: 'airsim', method: 'settings_get', expect: {}, reject: true });
 var getStatus = rpc.declare({ object: 'airsim', method: 'status', expect: {}, reject: true });
@@ -74,7 +75,7 @@ return view.extend({
   }
 
   function input(key, label, type, help) {
-   fields[key] = E('input', { 'id': 'as-conn-' + key, 'type': type || 'text', 'class': 'as-input', 'value': String(settings[key]), 'autocomplete': 'off', 'maxlength': key === 'relay_url' ? 512 : 32 });
+   fields[key] = E('input', { 'id': 'as-conn-' + key, 'type': type || 'text', 'class': 'as-input', 'value': String(settings[key] == null ? "" : settings[key]), 'autocomplete': 'off', 'maxlength': key === 'relay_url' ? 512 : 32 });
    var kids = [E('label', { 'for': 'as-conn-' + key, 'class': 'as-field-label' }, label), fields[key]];
    if (help) kids.push(E('p', { 'class': 'as-caption' }, help));
    return E('div', { 'class': 'as-setting' }, kids);
@@ -151,6 +152,8 @@ return view.extend({
 
   var rootEl = E('div', { 'class': 'as-root' }, [
    ui.stylesheet(),
+   E('style', {}, glass.css()),
+   (ui.menu ? ui.menu('connect') : ''),
    E('header', { 'class': 'as-header' }, [
     E('div', {}, [E('div', { 'class': 'as-eyebrow' }, 'AirSIM · 连接'), E('h2', {}, '连接方式，自己定。'), E('p', {}, '只管 VIPME-M8 这一侧，不动 AirSIM 客户端。')]),
     E('span', { 'class': 'as-version' }, 'v' + config.version)

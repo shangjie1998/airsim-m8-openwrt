@@ -1,0 +1,819 @@
+#!/bin/sh
+# AirSIM for VIPME-M8 —— 联网（上网通道 + Wi-Fi 管理）后端，独立 rpcd 对象 airsim-net
+#
+# 为什么另起文件：/usr/libexec/rpcd/airsim 是上游整份覆盖文件，往里加动作等于
+# 把上游文件长期占住。这里只新增，ubus 上多一个 airsim-net 对象，与上游并存。
+#
+# 一句话分工：
+#   门（模式切换、能力判断、自检、回滚）全在 /usr/bin/airsim-netmode 里，
+#   这里只做「参数校验 + 调它 + 把结果转成页面能吃的 JSON」。
+#
+# 授权见 /usr/share/rpcd/acl.d/luci-app-airsim-net.json
+. /usr/share/libubox/jshn.sh
+
+# 允许用环境变量指到别处的副本（调试期跑 /tmp 里的版本用，正式安装走系统路径）
+NETMODE=${AIR_SIM_MODE:-/usr/bin/airsim-netmode}
+PROBE=${AIR_SIM_PROBE:-/usr/libexec/airsim-net-probe}
+
+jerr() { json_init; json_add_boolean ok 0; json_add_string error "$1"; json_dump; }
+
+# 写动作排他锁：模式切换 / 连 Wi-Fi / 改管理开关会动 wireless 与 uci 配置，
+# 两个并发写会踩出半份配置。mkdir 原子抢锁，记 PID 可接管僵死锁，退出释放。
+LOCK_DIR=/tmp/airsim-net.lock
+lock_acquire() {
+	if mkdir "$LOCK_DIR" 2>/dev/null; then
+		echo $$ > "$LOCK_DIR/pid" 2>/dev/null
+		return 0
+	fi
+	_old=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+	if [ -n "$_old" ] && ! kill -0 "$_old" 2>/dev/null; then
+		rm -rf "$LOCK_DIR"
+		mkdir "$LOCK_DIR" 2>/dev/null || return 1
+		echo $$ > "$LOCK_DIR/pid" 2>/dev/null
+		return 0
+	fi
+	return 1
+}
+lock_release() { rm -rf "$LOCK_DIR" 2>/dev/null; }
+
+need_probe() { [ -x "$PROBE" ] || { jerr '缺少能力探测脚本 airsim-net-probe'; exit 0; }; }
+need_mode()  { [ -x "$NETMODE" ] || { jerr '缺少切换脚本 airsim-netmode'; exit 0; }; }
+
+# 取一个探测键。screen 开头已跑过一次全量探测、把 key=value 缓存到
+# AIR_SIM_PROBE_CACHE 指向的文件时，直接读文件，不再为每个键重新 fork 探测脚本
+# （这颗 SoC 上一次 fork + uci/iw 扫描约 70ms，联网页首屏重复取一批键就多花近半秒）。
+# 缓存缺失/为空（扫描、连接等独立链路直接被调用）时回退原样 fork probe，行为不变。
+pk() {
+	local _k=$1
+	if [ -n "${AIR_SIM_PROBE_CACHE:-}" ] && [ -s "$AIR_SIM_PROBE_CACHE" ]; then
+		sed -n "s/^$_k=//p" "$AIR_SIM_PROBE_CACHE" 2>/dev/null | head -1
+	else
+		"$PROBE" -k "$_k" 2>/dev/null
+	fi
+}
+
+cfg_sta()  { pk sta_section; }
+cfg_ap()   { pk ap_section; }
+live_if()  { pk live_if; }
+band()     { pk band_label; }
+channels() { pk channels; }
+
+# 无线口名不写死：同一颗射频在 AP 模式叫 wlan0，STA 模式常叫 phy0-sta0（由 netifd
+# 按 phy 派生）。这里把 probe 探到的三个名字汇总去重，防火墙区按这一整组收录，
+# 两种模式下规则都能命中；取不到才回退历史默认 wlan0。
+wifi_devs() {
+	local _a _s _l _d _out=''
+	_a=$(pk ap_if)
+	_s=$(pk sta_if)
+	_l=$(pk live_if)
+	[ -n "$_a" ] || _a=wlan0
+	for _d in "$_l" "$_s" "$_a"; do
+		[ -z "$_d" ] && continue
+		case " $_out " in *" $_d "*) ;; *) _out="$_out $_d" ;; esac
+	done
+	echo "${_out# }"
+}
+
+# STA 接口对应的 network 段名（默认 wwan）。防火墙归属按这个 network 收敛，
+# 跟下面 wifi_connect 取同一个来源，避免脚本两处各写一份默认值。
+sta_net_name() {
+	local _sta _n
+	_sta=$(cfg_sta)
+	_n=$(uci -q get "wireless.$_sta.network" 2>/dev/null)
+	[ -n "$_n" ] || _n=wwan
+	echo "$_n"
+}
+
+# ---- 确保 STA 上行两段基础定义存在 ----
+# 刷机后、或原生 LuCI 从没连过 Wi-Fi 时，wireless.<sta>（managed 无线段）与
+# network.<net>（dhcp 上行段）可能压根没建。后端平时只往里填 SSID/密码、切开关，
+# 缺基础段 netifd 建不出 managed 口，表现就是「扫描得到周边、选网输密码后无 IP、
+# 无默认路由」。这里幂等补齐模板：已有字段不覆盖，段不存在才建。
+sta_ensure() {
+	local sta net radio
+	sta=${1:-}
+	[ -n "$sta" ] || { sta=$(cfg_sta); [ -n "$sta" ] || sta=wwan0; }
+	net=$(uci -q get "wireless.$sta.network" 2>/dev/null); [ -n "$net" ] || net=wwan
+	radio=$(pk radio); [ -n "$radio" ] || radio=radio0
+
+	# 段连类型都没有时先建一个 wifi-iface 段；只 set 具体字段会留下没有类型的裸段，
+	# wireless 靠 `=wifi-iface` 识别接口，认不出就当不存在。
+	[ -z "$(uci -q get "wireless.$sta" 2>/dev/null)" ] && uci -q set "wireless.$sta=wifi-iface"
+	[ -n "$(uci -q get "wireless.$sta.device" 2>/dev/null)" ] || uci -q set "wireless.$sta.device=$radio"
+	[ "$(uci -q get "wireless.$sta.mode" 2>/dev/null)" = sta ]  || uci -q set "wireless.$sta.mode=sta"
+	[ -n "$(uci -q get "wireless.$sta.network" 2>/dev/null)" ] || uci -q set "wireless.$sta.network=$net"
+	[ -n "$(uci -q get "wireless.$sta.ifname" 2>/dev/null)" ] || uci -q set "wireless.$sta.ifname=$sta"
+
+	if [ -z "$(uci -q get "network.$net.proto" 2>/dev/null)" ]; then
+		uci -q set "network.$net=interface"
+		uci -q set "network.$net.proto=dhcp"
+		uci -q set "network.$net.device=$sta"
+	fi
+	uci -q commit wireless 2>/dev/null || true
+	uci -q commit network 2>/dev/null || true
+}
+
+# 按 zone 名定位 firewall uci 段（取不到回空）。
+zone_section_by_name() {
+	uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='$1'\$/\1/p" | head -1
+}
+
+# 把指定 network 从 wan zone 摘出，保留其余成员。这版 uci 没有 delete_list（单条
+# 删除静默失败），只能整项 list 删掉再重建。蜂窝口 wan/wan6 不在此列。
+net_off_wan() {
+	local _net=$1 _wn _keep='' _n
+	_wn=$(zone_section_by_name wan)
+	[ -n "$_wn" ] || return 0
+	for _n in $(uci -q get "firewall.$_wn.network" 2>/dev/null); do
+		[ "$_n" = "$_net" ] || _keep="$_keep $_n"
+	done
+	uci -q delete "firewall.$_wn.network" 2>/dev/null || true
+	for _n in $_keep; do uci -q add_list "firewall.$_wn.network=$_n" 2>/dev/null || true; done
+}
+
+# 当前真正在跑的那个无线口：sysfs 探到的 live_if 优先，其次 STA 段配置名，再回退 AP 口。
+sta_live_if() {
+	local _d
+	_d=$(live_if)
+	[ -n "$_d" ] || _d=$(pk sta_if)
+	[ -n "$_d" ] || _d=$(pk ap_if)
+	[ -n "$_d" ] || _d=wlan0
+	echo "$_d"
+}
+
+# ---- 扫描：返回可连的 AP 列表 ----
+# 单射频设备在 AP 模式下 STA 接口是被禁用的，这时 iwinfo 没有接口可用，
+# 临时建一个 managed 接口扫完再删，不留痕迹。
+wifi_scan() {
+	local ifc tmp=0 out bssid ssid ch bandl sig enc cnt=0 skipped=0 first=1 tp rows
+	# 待配置态（热点关了、STA 还没 SSID）下射频会睡下去，iwinfo 只会回
+	# "Netlink error while awaiting scan results: No event received"。用 txpower 判一下，
+	# 睡着了就把无线栈顶起来再扫。
+	if [ "$(pk ap_disabled)" = 1 ]; then
+		_w=$(sta_live_if)
+		tp=$(iwinfo "$_w" info 2>/dev/null | awk -F': ' '/Tx-Power/{gsub(/ dBm/,"",$2); print $2; exit}')
+		if [ -z "$tp" ] || [ "$tp" = 0 ]; then
+			wifi up >/dev/null 2>&1
+			sleep 3
+		fi
+	fi
+	ifc=$(live_if)
+	# 热点开着时不做扫描：单射频扫一次会让连着热点的手机断几秒，而且 AP 接口本身
+	# 不响应扫描请求。让用户先把上面开关拨到 Wi-Fi 模式（热点关掉、射频腾出来）再扫。
+	if [ -n "$ifc" ]; then
+		_t=$(iw dev "$ifc" info 2>/dev/null | awk '/type/{print $2; exit}')
+		case "$_t" in
+			managed|station) ;;
+			ap|AP)
+				jerr '热点开着的时候不扫描（一扫就会把连着热点的设备断几秒）。先把上面开关拨到「Wi-Fi 上网」，热点关掉之后再来扫。'
+				return 0
+				;;
+			*) ifc='' ;;
+		esac
+	fi
+	if [ -z "$ifc" ]; then
+		ifc=scan0
+		if ! iw phy phy0 interface add scan0 type managed >/dev/null 2>&1; then
+			jerr '扫不了：无线接口没有起来，且临时接口建不出来'
+			return 0
+		fi
+		tmp=1
+		ip link set scan0 up >/dev/null 2>&1
+		# 新建的 managed 接口要等驱动就绪，立刻扫往往拿到空结果（真机上就是这个现象）。
+		sleep 2
+	fi
+	# 双频机型全信道扫（2.4G + 5G 都列），不按频段/信道定向约束。
+	rows=''
+	try=0
+		while :; do
+			try=$((try + 1))
+			out=$(iwinfo "$ifc" scan 2>/dev/null)
+			[ -n "$out" ] && break
+			[ "$try" -ge 3 ] && break
+			sleep 2
+		done
+		if [ -z "$out" ]; then
+			[ "$tmp" = 1 ] && { ip link set scan0 down >/dev/null 2>&1; iw dev scan0 del >/dev/null 2>&1; }
+			jerr '扫描没有返回结果（驱动这会儿不应答扫描，过 10 秒再点一次；这不影响已有连接）'
+			return 0
+		fi
+		rows=$(printf '%s\n' "$out" | awk '
+/^Cell /                 { addr = $5 }
+/^[[:space:]]*ESSID: /   {
+	ssid = $0
+	sub(/^[[:space:]]*ESSID: /, "", ssid)
+	gsub(/^"|"$/, "", ssid)                          # iwinfo 会带一层引号
+	gsub(/["\\]/, "", ssid)
+	if (ssid == "unknown" || ssid == "") ssid = ""   # 隐藏网络不列，页面单独引导手输
+}
+/^[[:space:]]*Mode: /    {
+	for (i = 1; i <= NF; i++) {
+		if ($i == "Frequency:") freq = $(i+1)
+		if ($i == "Band:")      bnd  = $(i+1) " " $(i+2)
+		if ($i == "Channel:")   chn  = $(i+1)
+	}
+}
+/^[[:space:]]*Signal: /  { sig = $2 " " $3 }
+/^[[:space:]]*Encryption: / {
+	enc = $0
+	sub(/^[[:space:]]*Encryption: /, "", enc)
+	gsub(/"/, "", enc)
+}
+/^Cell / {
+	if (addr_prev != "" && ssid_prev != "") print addr_prev "|" ssid_prev "|" chn_prev "|" bnd_prev "|" sig_prev "|" enc_prev
+	addr_prev = addr; ssid_prev = ""; chn_prev = ""; bnd_prev = ""; sig_prev = ""; enc_prev = ""
+	addr = $5
+}
+{
+	if (ssid != "") { ssid_prev = ssid; chn_prev = chn; bnd_prev = bnd; sig_prev = sig; enc_prev = enc; ssid = "" }
+}
+END {
+	if (ssid_prev != "") print addr_prev "|" ssid_prev "|" chn_prev "|" bnd_prev "|" sig_prev "|" enc_prev
+}
+')
+	[ "$tmp" = 1 ] && { ip link set scan0 down >/dev/null 2>&1; iw dev scan0 del >/dev/null 2>&1; }
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string band_label "$(band)"
+	json_add_string channels "$(channels)"
+	json_add_array aps
+	while IFS='|' read -r bssid ssid ch bandl sig enc; do
+		[ -n "$ssid" ] || continue           # 隐藏 SSID 的单独由页面引导手输
+		# iwinfo 扫描结果里非 ASCII 字节会被转义成字面 "\xe5\x88\x98" 这种 C 风格串，
+		# 直接吐给前端就是一片乱码，写进 uci 更连不上（wpa_supplicant 会当字面反斜杠）。
+		# 这里还原成真正的 UTF-8：printf %b 认 \xHH。只有出现 \x 才动手，
+		# 免得把 SSID 里本来就有的 \ 或 % 解释坏。
+		case "$ssid" in
+			*'\x'*) ssid=$(printf '%b' "$ssid") ;;
+		esac
+		cnt=$((cnt + 1))
+		json_add_object
+		json_add_string bssid "$bssid"
+		json_add_string ssid "$ssid"
+		json_add_string channel "$ch"
+		json_add_string band "$bandl"
+		json_add_string signal "$sig"
+		json_add_string encryption "$enc"
+		# 能不能连：开放网或 WPA2/WPA3（CCMP）算可连；只有 TKIP 的按不支持标出来
+		case "$enc" in
+			NONE) sup=1 ;;
+			*TKIP*) case "$enc" in *CCMP*) sup=1 ;; *) sup=0 ;; esac ;;
+			*) sup=1 ;;
+		esac
+		json_add_boolean supported "$sup"
+		json_close_object
+	done <<EOF
+$rows
+EOF
+	json_close_array
+	json_add_int count "$cnt"
+	json_add_int filtered "$skipped"
+	json_dump
+}
+
+# ---- 已保存的 Wi-Fi（永远不返回密码）----
+wifi_saved() {
+	local sta ssid enc
+	sta=$(cfg_sta); [ -n "$sta" ] || sta=wwan0
+	ssid=$(uci -q get "wireless.$sta.ssid" 2>/dev/null)
+	enc=$(uci -q get "wireless.$sta.encryption" 2>/dev/null)
+	json_init
+	json_add_boolean ok 1
+	json_add_string ssid "${ssid:-}"
+	json_add_string encryption "${enc:-}"
+	json_add_boolean has_key "$([ -n "$(uci -q get wireless.$sta.key 2>/dev/null)" ] && echo 1 || echo 0)"
+	json_dump
+}
+
+# ---- 连接：校验 → 写 uci → 交给 airsim-netmode wifi 做真正的切换与自检 ----
+wifi_connect() {
+	local ssid key enc sta radio out rc
+	json_load "$1" 2>/dev/null
+	json_get_var ssid ssid
+	json_get_var key key
+	json_get_var enc encryption
+	[ -n "$enc" ] || json_get_var enc enc      # 命令行习惯写 enc，页面写 encryption，两个都认
+	[ -n "$ssid" ] || { jerr '缺少 Wi-Fi 名称'; return 0; }
+	enc=${enc:-psk2}
+	case "$enc" in
+		psk2|sae|none) ;;
+		*) jerr '加密方式不支持（只支持 WPA2 / WPA3 / 开放）'; return 0 ;;
+	esac
+	sta=$(cfg_sta); [ -n "$sta" ] || sta=wwan0
+	sta_ensure "$sta"
+	if [ "$enc" != none ]; then
+		# 本次没带密码时，先看这个 SSID 是不是已经存过、且存了 key：
+		# 是就用存的那份，让"点已保存的网络"不必再输一遍密码。
+		# 只认同一个 SSID —— 换网络时不拿旧密码去试，免得把旧 key 写进新段。
+		if [ -z "$key" ]; then
+			if [ "$(uci -q get "wireless.$sta.ssid" 2>/dev/null)" = "$ssid" ] &&
+			   [ -n "$(uci -q get "wireless.$sta.key" 2>/dev/null)" ]; then
+				key=$(uci -q get "wireless.$sta.key")
+			else
+				jerr '缺少密码'
+				return 0
+			fi
+		fi
+		if [ "${#key}" -lt 8 ] || [ "${#key}" -gt 63 ]; then
+			jerr '密码长度不对（WPA2/WPA3 要 8~63 个字符）'
+			return 0
+		fi
+	fi
+	# 关掉其它 wifi-iface 的 SSID 冲突：不碰，只写 STA 自己的段
+	uci -q set "wireless.$sta.ssid=$ssid"
+	uci -q set "wireless.$sta.encryption=$enc"
+	if [ "$enc" = none ]; then
+		uci -q delete "wireless.$sta.key" 2>/dev/null || true
+	else
+		uci -q set "wireless.$sta.key=$key"
+	fi
+	uci -q set "wireless.$sta.disabled=0"
+	uci -q commit wireless || { jerr '写配置失败'; return 0; }
+
+	# 1) 已经在 Wi-Fi 模式、用的就是这个 SSID、而且有地址 → 直接算成功。
+	#    这种情况再 reload 会把网断几秒，用户看到的就是「点了连接反而掉线」。
+	#    但传了 key 的不短路 —— 那是用户主动输密码（可能是改密码），必须 reload 让新密码生效，
+	#    不然 uci 里写了新 key 但 wpa_supplicant 还在用旧密码，当前连接不断，下次重连才发现连不上。
+	local _st _st_mode _st_ssid _st_ip sta_net
+	sta_net=$(uci -q get "wireless.$sta.network" 2>/dev/null); [ -n "$sta_net" ] || sta_net=wwan
+	_st=$("$NETMODE" status --json 2>/dev/null)
+	_st_mode=$(printf '%s' "$_st" | sed -n 's/.*"mode":"\([^"]*\)".*/\1/p')
+	_st_ssid=$(printf '%s' "$_st" | sed -n 's/.*"sta_ssid":"\([^"]*\)".*/\1/p')
+	_st_ip=$(printf '%s' "$_st" | sed -n 's/.*"sta_ip":"\([^"]*\)".*/\1/p')
+	if [ -z "$key" ] && [ "$_st_mode" = wifi ] && [ "$_st_ssid" = "$ssid" ] && [ -n "$_st_ip" ]; then
+		json_init
+		json_add_boolean ok 1
+		json_add_int code 0
+		json_add_string message "已经连着 ${ssid}（${_st_ip}），无需重连"
+		json_dump
+		return 0
+	fi
+
+	# 2) 已经在 Wi-Fi 模式但换了网络：reload 让 STA 按新的 uci 重新关联
+	if [ "$_st_mode" = wifi ]; then
+		/etc/init.d/network reload >/dev/null 2>&1 || true
+		ifup "$sta_net" >/dev/null 2>&1 || true
+	fi
+	out=$("$NETMODE" wifi 2>&1); rc=$?
+	json_init
+	json_add_boolean ok "$([ "$rc" = 0 ] && echo 1 || echo 0)"
+	json_add_int code "$rc"
+	json_add_string message "$out"
+	json_dump
+}
+
+# ---- 删除：正在用的话先要求切回流量，避免删完没网 ----
+wifi_forget() {
+	local sta ssid
+	sta=$(cfg_sta); [ -n "$sta" ] || sta=wwan0
+	ssid=$(uci -q get "wireless.$sta.ssid" 2>/dev/null)
+	if "$NETMODE" status --json 2>/dev/null | grep -q '"mode":"wifi"'; then
+		jerr '当前正在用这个 Wi-Fi 上网，删掉会直接断网。请先切回「流量」模式再删。'
+		return 0
+	fi
+	uci -q delete "wireless.$sta.ssid" 2>/dev/null
+	uci -q delete "wireless.$sta.key" 2>/dev/null
+	uci -q set "wireless.$sta.disabled=1"
+	uci -q commit wireless || { jerr '写配置失败'; return 0; }
+	json_init
+	json_add_boolean ok 1
+	json_add_string message "已删除保存的 Wi-Fi（${ssid:-未命名}）"
+	json_dump
+}
+
+# ---- 状态 / 模式切换 ----
+# 这两处直接拼 JSON：jshn 的老版本没有 raw 拼接，硬塞字符串会把内层双引号转义掉，
+# 页面拿到的就是一段转义后的文本，不是对象。
+net_status() {
+	_out=$("$NETMODE" status --json 2>/dev/null)
+	[ -n "$_out" ] || { jerr '取不到状态'; return 0; }
+	printf '{"ok":true,"status":%s}\n' "$_out"
+}
+
+net_mode_set() {
+	local mode out rc
+	json_load "$1" 2>/dev/null
+	json_get_var mode mode
+	case "$mode" in
+		cell|wifi|ap) ;;
+		*) jerr '未知模式（只支持 cell / wifi / ap）'; return 0 ;;
+	esac
+	out=$("$NETMODE" "$mode" 2>&1); rc=$?
+	json_init
+	json_add_boolean ok "$([ "$rc" = 0 ] && echo 1 || echo 0)"
+	json_add_int code "$rc"
+	json_add_string mode "$mode"
+	json_add_string message "$out"
+	json_dump
+}
+
+net_probe() {
+	need_probe
+	_out=$("$PROBE" 2>/dev/null)
+	[ -n "$_out" ] || { jerr '取不到能力信息'; return 0; }
+	printf '{"ok":true,"probe":%s}\n' "$_out"
+}
+
+# ---- 管理页面访问：从 Wi-Fi 那边能不能打开 LuCI（80/443）----
+#
+# 为什么必须绑网卡：不绑 iifname 的话，fw4 渲染出来就是一条
+#   tcp dport { 80, 443 } accept
+# 对所有入口生效。切到「手机流量」模式时 wan 是通公网的，管理页就等于
+# 挂在运营商网络上 —— 只要有人扫到这个地址，就能一直试密码。
+# 绑 wlan0 之后只认无线口，蜂窝口永远进不来，忘了关也漏不到公网。
+#
+# USB 是这台机器的唯一后手：开关只增删这一条 wlan0 规则，从不碰 earlyusb / lan 两个区，
+# 所以关掉开关只是「Wi-Fi 那边进不去」，插 USB 线的管理入口一直可用（2026-11-11 实测：
+# 开关关掉时 192.168.9.1 仍返 403 登录跳转，SSH 不断）。
+RULE_NAME=Allow-LuCI-wwan
+ZONE_NAME=wlanadmin
+ADMIN_PORTS='80 443'
+FW_INIT=/etc/init.d/firewall
+
+admin_sections() {
+	uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@rule\[[0-9]*\]\)\.name='$RULE_NAME'\$/\1/p"
+}
+
+# wlan0 原先不属于任何 firewall 区。没有区的时候，fw4 会把"只有 device、没有 src"的规则
+# 当成出口规则渲染进 output 链 —— 表里看得到一条，input 那边照样 policy drop，
+# 从 Wi-Fi 打进来直接丢包（2026-11-11 真机踩到：开关显示已生效，192.168.50.230 打不开）。
+# 所以给无线口建一个"只收不放"的区，规则挂进这个区，fw4 才会渲染到 input 侧。
+admin_zone_sections() {
+	uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='$ZONE_NAME'\$/\1/p"
+}
+
+admin_zone_ensure() {
+	_s=$(admin_zone_sections | head -1)
+	_net=$(sta_net_name)
+	if [ -n "$_s" ]; then
+		# 接口名会随模式变（wlan0 / phy0-sta0）：整项 device 列表清掉重列去重。
+		# 这版 uci 没有 delete_list（逐条删静默失败），沿用旧写法会反复 add 堆出重复项。
+		uci -q delete "firewall.$_s.device" 2>/dev/null || true
+		for _d in $(wifi_devs); do
+			uci -q add_list "firewall.$_s.device=$_d" 2>/dev/null || true
+		done
+		# 归属收敛（2026-11-20 真机踩到）：fw4 里 network 归属优先于 device 归属，
+		# STA 上行口若仍挂在 wan zone，input 先跳 input_wan（REJECT），本区放行规则
+		# 根本够不到。把 STA net 从 wan 摘出、挂到本区，直连端口规则才在 input 侧命中。
+		net_off_wan "$_net"
+		_has=0
+		for _n in $(uci -q get "firewall.$_s.network" 2>/dev/null); do
+			[ "$_n" = "$_net" ] && _has=1
+		done
+		[ "$_has" = 0 ] && uci -q add_list "firewall.$_s.network=$_net" 2>/dev/null || true
+		return 0
+	fi
+	uci -q add firewall zone >/dev/null || return 1
+	uci -q set "firewall.@zone[-1].name=$ZONE_NAME"
+	for _d in $(wifi_devs); do
+		uci -q add_list "firewall.@zone[-1].device=$_d" 2>/dev/null || true
+	done
+	uci -q add_list "firewall.@zone[-1].network=$_net" 2>/dev/null || true
+	net_off_wan "$_net"
+	uci -q set "firewall.@zone[-1].input=REJECT"
+	uci -q set "firewall.@zone[-1].output=ACCEPT"
+	uci -q set "firewall.@zone[-1].forward=REJECT"
+	return 0
+}
+
+admin_enabled() {
+	_s=$(admin_sections | head -1)
+	[ -n "$_s" ] || return 1
+	[ "$(uci -q get firewall.$_s.target)" = ACCEPT ] || return 1
+	return 0
+}
+
+# uci 里有不等于表里有：reload 没渲染成功时规则根本不生效，必须看 nft
+admin_live() {
+	# 光"表里有这个 comment"不算数：早先它落在 output 链里，看着开了其实没开。
+	# 必须 input 链真的跳到无线口的区链，且区链里真的放行 80/443。
+	# 口名随模式变（wlan0 / phy0-sta0），这里只认 jump 到本区链，不绑死具体 iifname。
+	nft list chain inet fw4 input 2>/dev/null | grep -q "jump input_$ZONE_NAME" || return 1
+	nft list chain inet fw4 input_$ZONE_NAME 2>/dev/null | grep -q 'dport { 80, 443 }' || return 1
+	return 0
+}
+
+admin_json() {
+	json_init
+	json_add_boolean ok 1
+	json_add_boolean enabled "$([ "$1" = 1 ] && echo 1 || echo 0)"
+	json_add_boolean live "$([ "$2" = 1 ] && echo 1 || echo 0)"
+	json_add_string device "$(wifi_devs)"
+	json_add_string ports "$ADMIN_PORTS"
+	json_add_string message "$3"
+	json_dump
+}
+
+admin_status() {
+	if admin_enabled; then _e=1; else _e=0; fi
+	if admin_live; then _l=1; else _l=0; fi
+	admin_json "$_e" "$_l" ''
+}
+
+# ---- 直连端口与 mDNS 放行 ----
+# 为什么必须有这一段：Wi-Fi 上行模式下手机和设备的联系全靠 wlan0，
+# 而 wlan0 属于 wlanadmin 区（input=REJECT）。8580-8582 这类直连端口和
+# 5353 组播一条规则都没有，端口绑上去照样被拒（2026-11-12 真机实测：
+# input_wlanadmin 里只有 80/443，reject_from_wlanadmin 里 iifname wlan0 全拒）。
+# 所以这里补两条常驻规则，和 LuCI 的开关解耦：关掉管理页访问不影响手机连接。
+DIRECT_RULE=Allow-AirSIM-direct
+MDNS_RULE=Allow-AirSIM-mdns
+DIRECT_DATA=/mnt/mu300-disk/extra/airsim/data
+DIRECT_HOST_FILE=/tmp/airsim-direct-host
+
+rule_sections() {
+	uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@rule\[[0-9]*\]\)\.name='$1'\$/\1/p"
+}
+
+json_port() {
+	grep -o "\"$1\":[0-9]\{1,5\}" "$DIRECT_DATA/management.json" 2>/dev/null | head -1 | cut -d: -f2
+}
+
+json_str() {
+	grep -o "\"$1\":\"[^\"]*\"" "$DIRECT_DATA/management.json" 2>/dev/null | head -1 | cut -d'"' -f4
+}
+
+# 端口以设备上的真实设置（management.json）为准，读不到才回退默认值 ——
+# 页面上改过端口的话，防火墙必须跟着改，否则改了端口就连不上。
+direct_ports() {
+	_p=$(json_port pair_port);  [ -n "$_p" ] || _p=8580
+	_c=$(json_port control_port); [ -n "$_c" ] || _c=8581
+	_m=$(json_port pcm_port);   [ -n "$_m" ] || _m=8582
+	echo "$_p $_c $_m"
+}
+
+direct_live() {
+	_n=$(nft list chain inet fw4 input_$ZONE_NAME 2>/dev/null | grep -c 'Allow-AirSIM-direct')
+	[ "$_n" -ge 1 ] || return 1
+	nft list chain inet fw4 input_$ZONE_NAME 2>/dev/null | grep -q 'Allow-AirSIM-mdns' || return 1
+	return 0
+}
+
+direct_sync_json() {
+	if direct_sync; then
+		json_init; json_add_boolean ok 1; json_add_string ports "$(direct_ports)"; json_dump
+	else
+		jerr '写不进防火墙规则'
+	fi
+}
+
+# 规则名字前缀统一 Allow-AirSIM-，加新规则前按前缀全清（不按固定名清，
+# 端口不连续时规则数会变，只认固定名会留垃圾）。
+air_rules() {
+	uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@rule\[[0-9]*\]\)\.name='Allow-AirSIM-[^']*'\$/\1/p"
+}
+
+# 关键坑（2026-11-12 真机踩到）：fw4 不认 "8580,8581,8582" 这种逗号写法，
+# 会报 invalid value 并把整条规则跳过 —— 表里能查到 uci 配置，nft 里却一条都没有。
+# 端口连续时用范围 "8580-8582" 一条搞定；不连续才拆成多条。
+direct_sync() {
+	admin_zone_ensure || return 1
+	_p1=$(json_port pair_port);     [ -n "$_p1" ] || _p1=8580
+	_p2=$(json_port control_port);  [ -n "$_p2" ] || _p2=8581
+	_p3=$(json_port pcm_port);      [ -n "$_p3" ] || _p3=8582
+	_want="$_p1-$_p3"
+	_cur=$(uci -q get "firewall.$(air_rules | head -1).dest_port" 2>/dev/null)
+	if direct_live && { [ "$_cur" = "$_want" ] || [ "$(air_rules | wc -l)" -ge 2 ]; }; then
+		return 0
+	fi
+	for _s in $(air_rules); do uci -q delete "firewall.$_s"; done
+
+	_add_rule() {
+		[ -n "$(_name_sections=$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@rule\[[0-9]*\]\)\.name='$1'\$/\1/p"); echo "$_name_sections")" ] && return 0
+		uci -q add firewall rule >/dev/null || return 1
+		uci -q set "firewall.@rule[-1].name=$1"
+		uci -q set "firewall.@rule[-1].src=$ZONE_NAME"
+		uci -q set "firewall.@rule[-1].proto=$2"
+		uci -q set "firewall.@rule[-1].dest_port=$3"
+		uci -q set "firewall.@rule[-1].target=ACCEPT"
+		uci -q set "firewall.@rule[-1].enabled=1"
+		return 0
+	}
+
+	if [ $((_p2)) -eq $((_p1 + 1)) ] && [ $((_p3)) -eq $((_p2 + 1)) ]; then
+		_add_rule Allow-AirSIM-direct tcp "$_p1-$_p3" || return 1
+	else
+		_n=1
+		for _p in $_p1 $_p2 $_p3; do
+			_add_rule "Allow-AirSIM-direct-$_n" tcp "$_p" || return 1
+			_n=$((_n + 1))
+		done
+	fi
+	_add_rule Allow-AirSIM-mdns udp 5353 || return 1
+	uci -q commit firewall >/dev/null 2>&1 || true
+	$FW_INIT reload >/dev/null 2>&1 || true
+	return 0
+}
+
+# 现算当前该对外宣告的直连地址（只读，不写文件、不触发重绑）：
+# Wi-Fi 上行时当前 STA 口有默认路由，用它的地址；热点 / 蜂窝模式退回 LAN 桥地址。
+rebind_host() {
+	local _d _sta _host _ldev
+	_d=$(sta_live_if)
+	_sta=$(ip -4 -o addr show dev "$_d" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+	if [ -n "$_sta" ] && ip route 2>/dev/null | grep -q "^default .*dev $_d"; then
+		_host=$_sta
+	fi
+	if [ -z "$_host" ]; then
+		_ldev=$(json_str interface); _ldev=${_ldev:-br-lan}
+		_host=$(ip -4 -o addr show dev "$_ldev" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+	fi
+	echo "$_host"
+}
+
+# 手机在哪个网段，广告里的 host 就得是哪个：Wi-Fi 上行时 STA 口有默认路由，
+# 用 STA 地址；热点 / 蜂窝模式用 LAN 桥地址。写进文件让 mu300d 采纳，
+# 再由它做运行期重绑（不重启进程，避免掐断正在进行的通话）。
+rebind_now() {
+	_host=$(rebind_host)
+	[ -n "$_host" ] || { jerr '没有可用的直连地址，先确认网卡拿到 IP'; return 0; }
+	printf '%s\n' "$_host" > "$DIRECT_HOST_FILE"
+	direct_sync >/dev/null 2>&1 || true
+	if command -v curl >/dev/null 2>&1; then
+		_res=$(curl -s -m 6 -X POST http://127.0.0.1:7581/rebind 2>/dev/null)
+	else
+		_res=$(printf 'POST /rebind HTTP/1.0\r\nContent-Length: 0\r\n\r\n' | nc 127.0.0.1 7581 2>/dev/null)
+	fi
+	json_init
+	json_add_boolean ok 1
+	json_add_string host "$_host"
+	json_add_string gateway "$_res"
+	json_dump
+}
+
+# 只读自检：直连端口 / mDNS 规则在不在防火墙表里、当前宣告哪个地址、走哪个无线口。
+# 给联网页一眼能看到，手机连不上时不用翻 nft。
+direct_status() {
+	local _live _host _file
+	_live=0; direct_live && _live=1
+	_file=$(cat "$DIRECT_HOST_FILE" 2>/dev/null)
+	_host=${_file:-$(rebind_host)}
+	json_init
+	json_add_boolean ok 1
+	json_add_boolean live "$_live"
+	json_add_string ports "$(direct_ports)"
+	json_add_string host "${_host:-}"
+	json_add_string devices "$(wifi_devs)"
+	json_add_string sta_if "$(pk sta_if)"
+	json_add_string ap_if "$(pk ap_if)"
+	json_add_string live_if "$(live_if)"
+	json_dump
+}
+
+# ---- 一屏所需数据：一次调用打包返回 ----
+# 页面首屏原来要发 4 个 ubus 请求（probe / status / wifi_saved / admin_status），
+# 每个请求都要过一次 rpcd、再起一个 shell，这颗 SoC 上光进程开销就 60 ms 一级；
+# 合成一个方法后串起来跑一次，联网页出卡片从 0.52 秒降到 0.3 秒上下。
+net_screen() {
+	local _f _p _s _w _a _d
+	# 探测只跑一次：拿 key=value 那份存成缓存文件，既喂给 airsim-netmode 查状态，
+	# 也喂给本脚本后面的 wifi_saved / admin_status / direct_status 取键，省掉为
+	# 每个键重新 fork 探测脚本（联网页首屏这部分约半秒，见 pk() 注释）。
+	_f=$(mktemp /tmp/.airsim-screen.XXXXXX 2>/dev/null) || _f=/tmp/.airsim-screen.$$
+	"$PROBE" -p >"$_f" 2>/dev/null || : >"$_f"
+	export AIR_SIM_PROBE_CACHE="$_f"
+	_p=$(awk -F= '
+		{ v[$1] = $2 }
+		END {
+			printf "{\"ok\":true,\"band\":\"%s\",\"band_label\":\"%s\",\"channels\":\"%s\",\"band_count\":%d,\"bands\":\"%s\",\"single_radio\":%s,\"noscan\":%s}\n",
+				v["band"], v["band_label"], v["channels"],
+				(v["band_count"] == "" ? 1 : v["band_count"]),
+				v["bands"],
+				(v["single_radio"] == "1" ? "true" : "false"),
+				(v["noscan"] == "1" ? "true" : "false")
+		}' "$_f")
+	_s=$("$NETMODE" status --json 2>/dev/null); [ -n "$_s" ] || _s='{"ok":false}'
+	_w=$(wifi_saved 2>/dev/null);     [ -n "$_w" ] || _w='{}'
+	_a=$(admin_status 2>/dev/null);   [ -n "$_a" ] || _a='{}'
+	_d=$(direct_status 2>/dev/null);  [ -n "$_d" ] || _d='{}'
+	rm -f "$_f"
+	[ -n "$_p" ] || _p='{"ok":false}'
+	printf '{"ok":true,"probe":%s,"status":%s,"saved":%s,"admin":%s,"direct":%s}\n' "$_p" "$_s" "$_w" "$_a" "$_d"
+}
+
+admin_set() {
+	# 参数可能是字符串 "1"、数字 1、布尔 true/false；ubus 传进来的 JSON 还带空格
+	# （{ "enable": 1 }），所以先抹掉空白再按原文判断，不走 jshn（它只认字符串，
+	# 数字型会让 json_get_var 拿到空值，点开关就被这条校验直接打回）。
+	_raw=$(printf '%s' "$1" | tr -d ' \t\n')
+	case "$_raw" in
+	*'"enable":"1"'*|*'"enable":1'*|*'"enable":true'*|*'"enable":"true"'*|*'"enable":"on"'*) enable=1 ;;
+	*'"enable":"0"'*|*'"enable":0'*|*'"enable":false'*|*'"enable":"false"'*|*'"enable":"off"'*) enable=0 ;;
+	*) jerr '开关只接受 开 / 关'; return 0 ;;
+	esac
+
+	# 历史上可能留了不止一条同名规则（手工 uci 加过那种），先全清再按当前开关写一条
+	for _s in $(admin_sections); do
+		uci -q delete "firewall.$_s"
+	done
+
+	if [ "$enable" = 1 ]; then
+		admin_zone_ensure || { jerr '写不进 firewall 区配置'; return 0; }
+		uci -q add firewall rule >/dev/null || { jerr '写不进 firewall 配置'; return 0; }
+		uci -q set "firewall.@rule[-1].name=$RULE_NAME"
+		uci -q set "firewall.@rule[-1].src=$ZONE_NAME"
+		uci -q set "firewall.@rule[-1].proto=tcp"
+		uci -q set "firewall.@rule[-1].dest_port=$ADMIN_PORTS"
+		uci -q set "firewall.@rule[-1].target=ACCEPT"
+		uci -q set "firewall.@rule[-1].enabled=1"
+	else
+		# 关掉时把它专用的区一并收走，回到出厂状态（区里还有别的规则就不动）
+		_s=$(admin_zone_sections | head -1)
+		if [ -n "$_s" ]; then
+			_n=$(uci show firewall 2>/dev/null | grep -c "\.src='$ZONE_NAME'\$")
+			[ "$_n" -eq 0 ] && uci -q delete "firewall.$_s"
+		fi
+	fi
+	uci -q commit firewall || { jerr '提交 firewall 配置失败'; return 0; }
+
+	# reload 优先：restart 的返回码会被 fw4 的渲染检查误导，成败以 nft 里有没有这条为准
+	_out=$("$FW_INIT" reload 2>&1); _rc=$?
+	_i=0
+	while [ "$_i" -lt 6 ]; do
+		if [ "$enable" = 1 ]; then
+			admin_live && break
+		else
+			admin_live || break
+		fi
+		sleep 1
+		_i=$((_i + 1))
+	done
+
+	if admin_enabled; then _e=1; else _e=0; fi
+	if admin_live; then _l=1; else _l=0; fi
+	if [ "$enable" = 1 ] && [ "$_l" = 1 ]; then
+		_msg='已允许：从 Wi-Fi 口能打开管理页（只放行 80/443）'
+	elif [ "$enable" = 1 ]; then
+		_msg="规则已写进配置，但没进防火墙表，现在仍进不来：$_out"
+	elif [ "$_l" = 0 ]; then
+		_msg='已禁止：从 Wi-Fi 口进不了管理页（USB 口照旧可用）'
+	else
+		_msg="配置已删，但表里还留着这条，建议重启一次防火墙：$_out"
+	fi
+	admin_json "$_e" "$_l" "$_msg"
+}
+
+FLOWFIX=/usr/libexec/airsim-flowfix
+
+# 5.4 热点客户端"无互联网"体检 / 修复。check 只读；fix 会改 firewall.flow_offloading 并重启防火墙。
+flowfix() {
+	_mode=$1
+	_out=$(sh "$FLOWFIX" --"$_mode" 2>&1)
+	_rc=$?
+	_res=$(printf '%s\n' "$_out" | sed -n 's/^RESULT=//p' | tail -1)
+	json_init
+	json_add_boolean ok $([ "$_rc" = 0 ] && echo 1 || echo 0)
+	json_add_string mode "$_mode"
+	json_add_string result "${_res:-error}"
+	json_add_string kernel "$(uname -r)"
+	json_add_string output "$_out"
+	json_dump
+}
+
+case "$1" in
+list)
+	printf '%s\n' '{"probe":{},"status":{},"screen":{},"mode_set":{"mode":""},"wifi_scan":{},"wifi_saved":{},"wifi_connect":{"ssid":"","key":"","encryption":""},"wifi_forget":{"ssid":""},"flowfix_check":{},"flowfix_fix":{},"admin_status":{},"admin_set":{"enable":""},"rebind":{},"direct_status":{},"direct_sync":{}}'
+	;;
+call)
+	# rpcd 走 exec 插件时，调用参数是从 stdin 灌进来的，argv 里只有 call 和 方法名
+	# （2026-11-11 抓包确认：$1=call $2=admin_set $3 空，stdin={"enable":1}）。
+	# 以前这里读 "$3"，等于所有带参数的方法都拿不到值 —— 开关点了就报"只接受 1/0"
+	# 就是这么来的。手动 `sh 脚本 call 方法 '{"..."}'` 调试时参数在 $3，两条路都留。
+_args=${3:-}
+if [ ! -t 0 ]; then
+	_stdin=$(cat 2>/dev/null)
+	[ -n "$_stdin" ] && _args=$_stdin
+fi
+	need_probe
+	# 只有改配置的动作抢锁；扫描/状态查询不占锁，避免读被写堵死。
+	case " mode_set wifi_connect wifi_forget admin_set rebind direct_sync flowfix_fix " in
+	*" $2 "*)
+		lock_acquire || { jerr '网络配置正在调整，请稍后再试'; exit 0; }
+		trap lock_release EXIT
+		;;
+	esac
+	case "$2" in
+	flowfix_check) flowfix check ;;
+	flowfix_fix)   flowfix fix ;;
+	admin_status)  admin_status ;;
+	admin_set)     admin_set "$_args" ;;
+	rebind)        rebind_now ;;
+	direct_status) direct_status ;;
+	direct_sync)   direct_sync_json ;;
+	probe)        net_probe ;;
+	screen)       net_screen ;;
+	status)       need_mode; net_status ;;
+	mode_set)     need_mode; net_mode_set "$_args" ;;
+	wifi_scan)    wifi_scan ;;
+	wifi_saved)   wifi_saved ;;
+	wifi_connect) need_mode; wifi_connect "$_args" ;;
+	wifi_forget)  need_mode; wifi_forget ;;
+	*)            jerr "未知方法：$2" ;;
+	esac
+	;;
+*)
+	printf '%s\n' '{"error":"用法: airsim-net {list|call}"}'
+	exit 1
+	;;
+esac

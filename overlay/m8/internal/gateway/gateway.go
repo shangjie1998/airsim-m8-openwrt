@@ -49,7 +49,7 @@ func New(path, id string) (*Gateway, error) {
 	if err != nil {
 		return nil, err
 	}
-	if json.Unmarshal(b, &g.keys) != nil || len(g.keys) > 16 {
+	if json.Unmarshal(b, &g.keys) != nil {
 		return nil, errors.New("invalid gateway state")
 	}
 	for _, key := range g.keys {
@@ -68,8 +68,8 @@ func decode(s string) ([]byte, error) {
 }
 
 // CheckAdd checks a candidate without authorizing it. Pairing uses this before
-// Agent registration; a rejected registration must not consume a client slot.
-// Add checks again when committing, since capacity may have changed meanwhile.
+// Agent registration; a rejected registration must not authorize a local key.
+// Pairings have no fixed count limit. Add still validates before durable storage.
 func (g *Gateway) CheckAdd(encoded string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -83,9 +83,6 @@ func (g *Gateway) checkAddLocked(encoded string) error {
 		if key == encoded {
 			return nil
 		}
-	}
-	if len(g.keys) >= 16 {
-		return errors.New("gateway client limit reached")
 	}
 	return nil
 }
@@ -131,83 +128,109 @@ func (g *Gateway) saveLocked(keys []string) error {
 	return os.Rename(g.path+".tmp", g.path)
 }
 
-// ClientInfo is what the web UI can show about a paired device. The key itself
-// is opaque, so only its tail is exposed to tell the entries apart.
-// clientOnlineWindow is how long a client counts as online after its last
-// authenticated request. The app polls health and long-polls events every few
-// seconds while awake, so a two-minute gap means it is gone.
+// ClientInfo contains a SHA-256 fingerprint, never key bytes or a key suffix.
+// Activity is authenticated direct traffic observed during this process lifetime.
+// Cloud relay traffic does not identify a direct pairing and is not inferred.
 const clientOnlineWindow = 120 * time.Second
 
 type ClientInfo struct {
-	Index       int    `json:"index"`
-	Fingerprint string `json:"fingerprint"`
-	LastUsed    int64  `json:"last_used,omitempty"`
-	Online      bool   `json:"online"`
+	ID       string `json:"id"`
+	LastUsed int64  `json:"last_used,omitempty"`
+	Recent   bool   `json:"recent"`
 }
 
-func fingerprint(encoded string) string {
-	if len(encoded) <= 8 {
-		return encoded
+// watchOwner derives the public owner fingerprint from a verified pairing key.
+// It is a one-way digest; the raw key is never copied into a response or log.
+func watchOwner(key []byte) string { return fmt.Sprintf("%x", sha256.Sum256(key)) }
+
+func (g *Gateway) touchClientLocked(owner string, now int64) {
+	if g.lastUsed == nil {
+		g.lastUsed = make(map[string]int64)
 	}
-	return encoded[len(encoded)-8:]
+	g.lastUsed[owner] = now
 }
 
-// Clients lists the paired devices in file order, with the last time each one
-// authenticated (0 when it has not been used since the service started).
+// Clients returns the durable paired fingerprints with in-memory activity.
 func (g *Gateway) Clients() []ClientInfo {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	out := make([]ClientInfo, 0, len(g.keys))
+	result := make([]ClientInfo, 0, len(g.keys))
 	now := time.Now().Unix()
-	for i, encoded := range g.keys {
-		lastUsed := g.lastUsed[encoded]
-		out = append(out, ClientInfo{
-			Index:       i + 1,
-			Fingerprint: fingerprint(encoded),
-			LastUsed:    lastUsed,
-			Online:      lastUsed > 0 && now-lastUsed <= int64(clientOnlineWindow/time.Second),
-		})
+	for _, encoded := range g.keys {
+		key, _ := decode(encoded)
+		owner := watchOwner(key)
+		clear(key)
+		used := g.lastUsed[owner]
+		result = append(result, ClientInfo{owner, used, used > 0 && now >= used && now-used <= int64(clientOnlineWindow/time.Second)})
 	}
-	return out
+	return result
 }
 
-// Remove drops the given one-based indexes and persists the remaining keys.
-func (g *Gateway) Remove(indexes []int) (int, error) {
+func (g *Gateway) hasClientLocked(owner string) bool {
+	for _, encoded := range g.keys {
+		key, _ := decode(encoded)
+		match := watchOwner(key) == owner
+		clear(key)
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// reserveClientPCMLocked admits one owner to the shared PCM slot. A key removed
+// after handshake authentication must not open a new audio session.
+func (g *Gateway) reserveClientPCMLocked(owner string) bool {
+	if g.pcm || g.closing || !g.hasClientLocked(owner) {
+		return false
+	}
+	g.pcm = true
+	return true
+}
+
+// RemoveClientIdle uses the durable remove path under the admission lock.
+// Unknown IDs are harmless (idempotent). No service restart or modem command.
+func (g *Gateway) RemoveClientIdle(owner string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	drop := make(map[int]bool, len(indexes))
-	for _, n := range indexes {
-		if n >= 1 && n <= len(g.keys) {
-			drop[n] = true
+	if g.pcm || g.earlyStreamDone != nil {
+		return errors.New("音频会话进行中，请结束后再移除配对")
+	}
+	for _, encoded := range g.keys {
+		key, _ := decode(encoded)
+		match := watchOwner(key) == owner
+		clear(key)
+		if match {
+			return g.removeLocked(encoded)
 		}
 	}
-	if len(drop) == 0 {
-		return 0, nil
+	return nil
+}
+
+func (g *Gateway) removeLocked(encoded string) error {
+	parent, e := decode(encoded)
+	if e != nil {
+		return e
 	}
+	owner := watchOwner(parent)
+	clear(parent)
 	keys := make([]string, 0, len(g.keys))
-	for i, encoded := range g.keys {
-		if drop[i+1] {
-			continue
+	for _, k := range g.keys {
+		if k != encoded {
+			keys = append(keys, k)
 		}
-		keys = append(keys, encoded)
 	}
 	if err := g.saveLocked(keys); err != nil {
-		return 0, err
+		return err
 	}
 	g.keys = keys
-	for encoded := range g.lastUsed {
-		kept := false
-		for _, key := range keys {
-			if key == encoded {
-				kept = true
-				break
-			}
-		}
-		if !kept {
-			delete(g.lastUsed, encoded)
+	delete(g.lastUsed, owner)
+	for k, lease := range g.earlyLeases {
+		if lease.owner == "wlan:"+owner {
+			delete(g.earlyLeases, k)
 		}
 	}
-	return len(drop), nil
+	return nil
 }
 func Sign(key []byte, canonical string) string {
 	m := hmac.New(sha256.New, key)
@@ -241,10 +264,7 @@ func (g *Gateway) authenticate(method, path string, body []byte, ts, nonce, sig 
 		key, _ := decode(encoded)
 		if hmac.Equal([]byte(Sign(key, canonical(method, path, body, ts, nonce))), []byte(sig)) {
 			g.seen[nonce] = now + 61
-			if g.lastUsed == nil {
-				g.lastUsed = make(map[string]int64)
-			}
-			g.lastUsed[encoded] = now
+			g.touchClientLocked(watchOwner(key), now)
 			return key
 		}
 	}
@@ -459,6 +479,7 @@ func (g *Gateway) ServePCM(ctx context.Context, c net.Conn) {
 		g.event("pcm_auth_rejected")
 		return
 	}
+	owner := watchOwner(key)
 	clear(key)
 	g.event("pcm_authenticated")
 	// Wait for receive-only teardown before opening duplex on the shared DSP.
@@ -475,12 +496,11 @@ func (g *Gateway) ServePCM(ctx context.Context, c net.Conn) {
 		}
 	}
 	g.mu.Lock()
-	if g.pcm {
+	if !g.reserveClientPCMLocked(owner) {
 		g.mu.Unlock()
 		g.event("pcm_busy")
 		return
 	}
-	g.pcm = true
 	g.mu.Unlock()
 	defer func() { g.mu.Lock(); g.pcm = false; g.mu.Unlock() }()
 	upstream, err := net.DialTimeout("tcp", "127.0.0.1:7580", 3*time.Second)

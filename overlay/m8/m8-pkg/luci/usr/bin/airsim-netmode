@@ -1,0 +1,406 @@
+#!/usr/bin/env sh
+# AirSIM 上网通道切换（接口版，可被页面 / ubus / 命令行/ 定时任务调用）
+#
+# 模式指纹（判断当前模式的唯一依据，跟作者那份 netmode 完全一致）：
+#   cell = (wan 0, ap 1, sta 1)   走蜂窝，Wi-Fi 全关
+#   wifi = (wan 1, ap 1, sta 0)   连外部 Wi-Fi 上网，热点与蜂窝都关
+#   ap   = (wan 0, ap 0, sta 1)   自带热点，蜂窝供网
+#
+# 用法：
+#   airsim-netmode status            人读的一行摘要
+#   airsim-netmode status --json     机器读（页面用）
+#   airsim-netmode cell|wifi|ap      切模式（会自检，失败自动回滚）
+#   airsim-netmode restore           按切走前记下的基线恢复
+#   airsim-netmode --check           只做能力探测（等同 airsim-net-probe -p）
+#
+# 退出码：0 成功 / 1 参数或环境错误 / 3 管理口结构不符预期（拒绝执行）
+#         4 还没配过 Wi-Fi / 5 自检没过已回滚 / 6 用法错误
+#
+# 硬约束：只动 wireless 的 ap0、wwan0 与 network 的 wan、wwan；
+#         绝不动 lan / br-lan / usb0 —— USB 管理口永远在（具体地址是配置值，不是常量）。
+set -u
+
+PROBE=${AIR_SIM_PROBE:-/usr/libexec/airsim-net-probe}
+[ -x "$PROBE" ] || PROBE=$(dirname "$0")/airsim-net-probe
+
+say() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
+
+# 探测脚本只读，但每跑一次要几十毫秒（十来次 uci 加系统读）；而在这颗 SoC 上
+# 每次 $( ) 取值再 fork 一遍 awk 也要 60 毫秒上下。原来每个键各取一次：启动 5 个键
+# 就要 0.35 秒，status 里还要再取一次 single_radio，于是「联网」页比别的页慢好几倍
+# （2026-11-11 实测 status 2.98 秒，别的页 0.3 秒）。
+# 改成：探测脚本整份取回一次（它本就有 -p 一次给全部键），启动的 5 个键用一次 awk 全取，
+# 后面零星单键才走 p()。启动从 0.35 秒降到 0.1 秒出头。
+_PCACHE=
+_PCACHE_MINE=
+_pc_load() {
+	[ -n "$_PCACHE" ] && return 0
+	# 调用方（比如 airsim-net 的 screen 方法）已经有探测结果时直接用，别为了几个键再 fork 一次
+	if [ -n "${AIR_SIM_PROBE_CACHE:-}" ] && [ -s "$AIR_SIM_PROBE_CACHE" ]; then
+		_PCACHE=$AIR_SIM_PROBE_CACHE
+		_PCACHE_MINE=0
+		return 0
+	fi
+	_PCACHE=$(mktemp /tmp/.airsim-probe.XXXXXX 2>/dev/null) || _PCACHE=/tmp/.airsim-probe.$$
+	_PCACHE_MINE=1
+	"$PROBE" -p >"$_PCACHE" 2>/dev/null || : >"$_PCACHE"
+}
+p() {
+	_pc_load
+	sed -n "s/^$1=//p" "$_PCACHE" 2>/dev/null | head -1
+}
+# 一次取多个键：按 list 里的顺序每行一个值，取不到的给空行
+p_many() {
+	_pc_load
+	awk -v list="$1" -F= '
+		BEGIN { n = split(list, a, ","); for (i = 1; i <= n; i++) v[i] = "" }
+		{ for (i = 1; i <= n; i++) if ($1 == a[i]) { sub(/^[^=]*=/, ""); v[i] = $0 } }
+		END { for (i = 1; i <= n; i++) print v[i] }' "$_PCACHE" 2>/dev/null
+}
+trap '[ -n "$_PCACHE_MINE" ] && [ "$_PCACHE_MINE" = 1 ] && rm -f "$_PCACHE"' EXIT INT TERM HUP
+
+{ IFS= read -r RADIO; IFS= read -r STA; IFS= read -r AP; IFS= read -r AP_IF; IFS= read -r CELL_IF; IFS= read -r LIVE_IF; IFS= read -r STA_CFG_IF; } <<EOF
+$(p_many 'radio,sta_section,ap_section,ap_if,cell_if,live_if,sta_if')
+EOF
+[ -n "${RADIO:-}" ] || RADIO=radio0
+[ -n "${STA:-}" ] || STA=wwan0
+[ -n "${AP:-}" ] || AP=ap0
+[ -n "${AP_IF:-}" ] || AP_IF=wlan0
+[ -n "${CELL_IF:-}" ] || CELL_IF=sipa_eth0
+# STA 实际口名：probe 从 sysfs 探到的在用无线口优先（STA 模式是 phy0-sta0，AP 模式
+# 是 wlan0），其次 uci 里配的 ifname，最后回退 AP_IF。早先这里一直拿 AP_IF（热点口
+# wlan0）去查 STA 关联 SSID / IP，STA 模式下 wlan0 根本不存在，页面就读成"未连接"。
+STA_IF=${LIVE_IF:-}
+[ -n "$STA_IF" ] || STA_IF=${STA_CFG_IF:-}
+[ -n "$STA_IF" ] || STA_IF=$AP_IF
+# STA 段绑到哪个 network 接口（默认 wwan）。开关 STA 时必须连着它一起开关：
+# netifd 只认 network 段的 disabled，两边不一致就会出现
+# wireless.wwan0.disabled=0 / network.wwan.disabled=1 的分裂状态，
+# 结果 ifup 静默无效、DHCP 永远不来（2026-11-14 真机踩的就是这个）。
+STA_NET=$(uci -q get "wireless.$STA.network" 2>/dev/null)
+[ -n "${STA_NET:-}" ] || STA_NET=wwan
+
+wan_dis()  { uci -q get network.wan.disabled 2>/dev/null; }
+ap_dis()   { uci -q get wireless.$AP.disabled 2>/dev/null; }
+sta_dis()  { uci -q get wireless.$STA.disabled 2>/dev/null; }
+radio_dis() { uci -q get wireless.$RADIO.disabled 2>/dev/null; }
+radio_on()  { uci -q set wireless.$RADIO.disabled=0; uci -q commit wireless; }
+radio_off() { uci -q set wireless.$RADIO.disabled=1; uci -q commit wireless; }
+# AP 与 STA 都关着时射频总开关才关掉；任一路由在用就把 radio 放开。
+# M8 固件基线 radio0.disabled=1：只翻 iface 的 disabled，netifd 根本不建 netdev
+# （2026-11-23 实测 wwan0 NO_DEVICE、wpa 无 per-iface 实例），必须同步 radio 总开关。
+radio_sync() {
+	if [ "$(ap_dis)" = 1 ] && [ "$(sta_dis)" = 1 ]; then radio_off; else radio_on; fi
+}
+
+norm() { [ "${1:-0}" = 0 ] && echo 0 || echo 1; }
+
+# 当前模式：严格按三个值判，判不出来就是 unknown
+cur_mode() {
+	local w a s
+	w=$(norm "$(wan_dis)"); a=$(norm "$(ap_dis)"); s=$(norm "$(sta_dis)")
+	case "$w$a$s" in
+		011) echo cell ;;
+		110) echo wifi ;;
+		010) echo wifi-pending ;;   # 热点已关、射频腾空、等用户扫描选网
+		001) echo ap ;;
+		011 | 110) echo wifi ;;
+		*) echo unknown ;;
+	esac
+}
+
+# 管理口结构守门：不符合就不许切，防止把管理地址搞丢
+guard() {
+	if [ "$(p lan_ok)" != 1 ]; then
+		err "拒绝执行：管理口结构与预期不符（lan 地址 $(p lan_ip)，br-lan 端口 $(p br_ports)）"
+		err '预期是 br-lan 只含 usb0、lan 有地址（当前管理口见上面那行）。请先人工核对，避免切换后 USB 管理口失联。'
+		exit 3
+	fi
+	[ "$(p single_radio)" = 1 ] || err '提示：本机不是单射频，热点与 Wi-Fi 可以同时存在，本脚本仍按互斥处理'
+}
+
+# ---- 基线：切走前记下原始状态，用于 restore / 失败回滚 ----
+save_base() {
+	uci -q set airsim.netmode=netmode >/dev/null 2>&1 || true
+	uci -q set airsim.netmode.prev_wan="$(norm "$(wan_dis)")" >/dev/null 2>&1
+	uci -q set airsim.netmode.prev_ap="$(norm "$(ap_dis)")" >/dev/null 2>&1
+	uci -q set airsim.netmode.prev_sta="$(norm "$(sta_dis)")" >/dev/null 2>&1
+	uci -q set airsim.netmode.prev_radio="$(norm "$(radio_dis)")" >/dev/null 2>&1
+	uci -q set airsim.netmode.from_mode="$(cur_mode)" >/dev/null 2>&1
+	uci -q set airsim.netmode.saved_at="$(date +%s 2>/dev/null || echo 0)" >/dev/null 2>&1
+	uci -q commit airsim >/dev/null 2>&1 || true
+}
+
+base_get() { uci -q get airsim.netmode.$1 2>/dev/null; }
+
+# ---- 底层动作：只碰这四个开关 ----
+set_wan() {
+	uci -q set network.wan.disabled="$1"
+	uci -q commit network
+	if [ "$1" = 0 ]; then ifup wan >/dev/null 2>&1 || true; else ifdown wan >/dev/null 2>&1 || true; fi
+}
+
+set_ap() {
+	uci -q set wireless.$AP.disabled="$1"
+	uci -q commit wireless
+}
+
+set_sta() {
+	uci -q set wireless.$STA.disabled="$1"
+	uci -q commit wireless
+	# 同步 network 段（$STA_NET，默认 wwan）。只改 wireless 不改 network 时，
+	# netifd 根本不建这个接口，后续 ifup 无效、DHCP 不来 → 关联成功却没 IP，
+	# check_wifi 超时回滚，页面停在 wifi-pending。
+	uci -q set "network.$STA_NET.disabled=$1"
+	uci -q commit network
+}
+
+wifi_reload() { wifi reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true; }
+
+# 默认路由落在哪个网卡上（空 = 没有默认路由）
+route_dev() {
+	ip route 2>/dev/null | awk '$1 == "default" { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+# 某个接口的 IPv4 地址（不带前缀）
+if_ip() {
+	ip -4 addr show "$1" 2>/dev/null | awk '/^[[:space:]]*inet /{ sub(/\/.*/, "", $2); print $2; exit }'
+}
+
+# STA 当前关联的 SSID（可能含空格，按到行尾取）
+sta_ssid() {
+	iw dev "$STA_IF" link 2>/dev/null | sed -n 's/^[[:space:]]*SSID: //p' | head -1
+}
+
+# ---- 自检：Wi-Fi 模式要求「有 IP + 默认路由在 STA 口」 ----
+# 实测：reload 之后关联 8~15 秒，DHCP 再要几秒，16 秒窗口太紧（第一次就是
+# 卡在这儿误判失败），这里放到 30 秒，并且一旦「关联上且有 IP」就继续等路由。
+# 某张网卡上有没有默认路由（可能同时存在两条：切 Wi-Fi 的那段时间蜂窝还没断）
+has_default_on() {
+	ip route 2>/dev/null | awk -v d="$1" '
+		$1 == "default" { for (i = 1; i <= NF; i++) if ($i == "dev" && $(i + 1) == d) found = 1 }
+		END { exit found ? 0 : 1 }'
+}
+
+check_wifi() {
+	local i ip ssid
+	i=0
+	while [ "$i" -lt 30 ]; do
+		ip=$(if_ip "$STA_IF")
+		ssid=$(sta_ssid)
+		# 判「Wi-Fi 有默认路由」时不能看全局第一条 default —— 切换过程中蜂窝那条还在，
+		# 2026-11-11 真机就栽在这：Wi-Fi 明明连上并拿到 192.168.50.230，自检却判失败回滚。
+		if [ -n "$ip" ] && has_default_on "$STA_IF"; then return 0; fi
+		# 关联已建立但还没拿到地址/路由，再等，别急着判死
+		if [ -n "$ssid" ] && [ "$i" -lt 25 ]; then sleep 1; i=$((i + 1)); continue; fi
+		sleep 1; i=$((i + 1))
+	done
+	return 1
+}
+
+# ---- 自检：蜂窝模式要求默认路由落在蜂窝网卡 ----
+check_cell() {
+	local i
+	i=0
+	while [ "$i" -lt 10 ]; do
+		has_default_on "$CELL_IF" && return 0
+		sleep 1; i=$((i + 1))
+	done
+	return 1
+}
+
+# ---- 专项：蜂窝用户数据承载必须为 0（cid1）；IMS 等专用 cid 保留是正常的 ----
+# 包一层 timeout：SIM 未注册时 mu300-at 可能挂住，3 秒取不到就按"承载已关"放行。
+data_bearer_off() {
+	command -v mu300-at >/dev/null 2>&1 || return 0
+	local out
+	out=$(timeout 3 mu300-at 'AT+CGACT?' 2>/dev/null | tr -d '\r')
+	case "$out" in
+		*+CGACT:1,1*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+rollback() {
+	local pw pa ps ok
+	pw=$(base_get prev_wan); pa=$(base_get prev_ap); ps=$(base_get prev_sta)
+	[ -n "$pw" ] || pw=0
+	[ -n "$pa" ] || pa=1
+	[ -n "$ps" ] || ps=1
+	err "自检没过，正在回滚到切换前（wan=$pw ap=$pa sta=$ps）"
+	set_ap "$pa"; set_sta "$ps"; radio_sync
+	# 基线里 radio 总开关的状态单独记了，按它恢复，别让 radio_sync 把基线是开着的射频关掉
+	[ -n "$(base_get prev_radio)" ] && uci -q set wireless.$RADIO.disabled="$(base_get prev_radio)"
+	uci -q commit wireless
+	wifi_reload
+	[ "$ps" = 0 ] && ifup "$STA_NET" >/dev/null 2>&1
+	set_wan "$pw"
+	# 回滚本身也要等，别刚发完 ifup 就退出，留下「没有默认路由」的空档
+	ok=0
+	if [ "$pw" = 0 ]; then check_cell && ok=1; fi
+	if [ "$ps" = 0 ]; then check_wifi && ok=1; fi
+	if [ "$ok" = 1 ]; then
+		err '已回滚到切换前状态'
+	else
+		err '回滚后仍没恢复默认路由：USB 管理口不受影响，但可能暂时上不了网。请进页面手动选一次模式。'
+	fi
+	exit 5
+}
+
+# 切完网必须让 mu300d 把直连监听和 Bonjour 广告搬到新地址：
+# iOS 只认 TXT 里的 host，旧地址还会被手机存进 UserDefaults。
+# 不重绑的表现就是"换了网络、手机还拿着旧 IP，必须重新配对"。
+# 走 rpcd 而不是重启服务 —— 重启会把正在通话的控制/PCM 会话一起掐掉。
+net_refresh() {
+	/sbin/ubus call airsim-net rebind >/dev/null 2>&1 || /bin/ubus call airsim-net rebind >/dev/null 2>&1 || true
+	return 0
+}
+
+do_cell() {
+	guard
+	case "$(cur_mode)" in cell) say '已经是蜂窝模式，无需切换'; return 0 ;; esac
+	save_base
+	say '正在切到蜂窝：先关热点与外部 Wi-Fi，再拨号'
+	set_ap 1
+	set_sta 1
+	radio_sync
+	wifi_reload
+	set_wan 0
+	if check_cell; then
+		net_refresh
+		say '蜂窝模式已就绪（默认路由在蜂窝网卡）'
+		return 0
+	fi
+	# 网卡没起来时给一次更宽松的判定：接口 up 且拿到地址就算（不限 mu300cell，
+	# M8 走 modemmanager，蜂窝口名由 probe 从 l3_device 取）
+	if ip -4 addr show "$CELL_IF" 2>/dev/null | grep -q 'inet '; then
+		say '蜂窝已拨上（默认路由暂未落到蜂窝，通常是刚拨完还没稳定，稍等再看）'
+		return 0
+	fi
+	rollback
+}
+
+do_wifi() {
+	guard
+	case "$(cur_mode)" in wifi) say '已经是 Wi-Fi 模式，无需切换'; return 0 ;; esac
+	# 还没配过外部 Wi-Fi 时，以前这里直接报错退回，等于把人锁死：要扫描得先关热点，
+	# 要关热点得先切模式，而切模式又要求先有 SSID。管理页走 USB 口，不依赖无线，
+	# 所以这里允许先把热点关掉、把射频腾出来，让用户去扫描选网；连上之后
+	# wifi_connect 会自己再走一遍完整切换（先连 Wi-Fi、再断蜂窝）。
+	if [ -z "$(uci -q get wireless.$STA.ssid 2>/dev/null)" ]; then
+		save_base
+		set_ap 1
+		set_sta 0
+		radio_sync
+		wifi_reload
+		net_refresh
+		say '热点已关，射频腾出来给扫描。回「联网」页点扫描、选一个 Wi-Fi 输密码；连上后自动切到 Wi-Fi 上网'
+		return 0
+	fi
+	save_base
+	say '正在切到 Wi-Fi：先把外部 Wi-Fi 连起来，连上之后再断蜂窝（反着来会先丢网）'
+	# 注：radio0 的 noscan 只管热点（hostapd 不做信道外扫描），实测对 STA 扫描与
+	# 关联毫无影响，所以这里一个字都不动它 —— 保持机器原始配置。
+	set_sta 0
+	set_ap 1
+	radio_sync
+	wifi_reload
+	ifup "$STA_NET" >/dev/null 2>&1 || true   # 催一下 DHCP，别干等
+	if ! check_wifi; then
+		err '外部 Wi-Fi 没连上（无 IP 或默认路由没落到无线口）'
+		rollback
+	fi
+	say 'Wi-Fi 已连上，现在断开蜂窝数据'
+	set_wan 1
+	if ! data_bearer_off; then
+		err '蜂窝用户数据承载（cid1）还在，没断干净'
+		# 补一脚厂商的 down，再确认一次（M8 上该工具可能不存在，先探后调）
+		command -v /opt/mu300/bin/mobile-data >/dev/null 2>&1 && /opt/mu300/bin/mobile-data down >/dev/null 2>&1 || true
+		ip -4 route del default dev "$CELL_IF" >/dev/null 2>&1 || true
+		if ! data_bearer_off; then rollback; fi
+	fi
+	# 光把 wan 置 disabled 不一定会立刻摘掉那条默认路由（2026-11-11 真机就是两条同时存在，
+	# 蜂窝那条 metric 更小、一直抢着出口）。这里把残留在蜂窝口的默认路由清掉，再确认出口唯一。
+	if has_default_on "$CELL_IF"; then
+		ip -4 route del default dev "$CELL_IF" >/dev/null 2>&1 || true
+		[ "$(ip route 2>/dev/null | grep -c '^default')" = 1 ] || err '提示：除了 Wi-Fi 还有一条默认路由，稍后可能又走回蜂窝'
+	fi
+	net_refresh
+	say 'Wi-Fi 模式已就绪（出口走 Wi-Fi，蜂窝数据已断，电话短信不受影响）'
+	return 0
+}
+
+do_ap() {
+	guard
+	case "$(cur_mode)" in ap) say '已经是热点模式，无需切换'; return 0 ;; esac
+	save_base
+	say '正在切到热点：先恢复蜂窝供网，再开热点'
+	set_sta 1
+	radio_sync
+	wifi_reload
+	set_wan 0
+	check_cell >/dev/null 2>&1 || err '提示：蜂窝还没完全就绪，热点开起来后可能暂时上不了网'
+	set_ap 0
+	radio_sync
+	wifi_reload
+	net_refresh
+	say '热点模式已就绪'
+	return 0
+}
+
+do_restore() {
+	guard
+	local pw pa ps
+	pw=$(base_get prev_wan); pa=$(base_get prev_ap); ps=$(base_get prev_sta)
+	if [ -z "$pw$pa$ps" ]; then err '没有可恢复的基线（还没切过模式）'; exit 1; fi
+	say "按基线恢复：wan=$pw ap=$pa sta=$ps"
+	set_sta "$ps"; set_ap "$pa"; radio_sync
+	[ -n "$(base_get prev_radio)" ] && uci -q set wireless.$RADIO.disabled="$(base_get prev_radio)"
+	uci -q commit wireless
+	wifi_reload
+	set_wan "$pw"
+	net_refresh
+	if [ "$pw" = 0 ]; then
+		say '已恢复蜂窝供网'
+	else
+		say '已恢复为流量关闭状态'
+	fi
+	return 0
+}
+
+do_status() {
+	local w a s m dev ssid ip
+	w=$(norm "$(wan_dis)"); a=$(norm "$(ap_dis)"); s=$(norm "$(sta_dis)")
+	m=$(cur_mode)
+	dev=$(route_dev)
+	ssid=$(sta_ssid)
+	ip=$(if_ip "$STA_IF")
+	# 开关指纹停在 wifi-pending（蜂窝开关没拨、热点关、STA 开），但 STA 口已关联并拿到
+	# 地址、默认路由也落在 STA 口 —— 实际就在用 Wi-Fi 上网，展示成 wifi，别报"待配置"。
+	# 只改展示态，cur_mode 切换守门仍按开关指纹，不受影响。
+	if [ "$m" = wifi-pending ] && [ -n "$ip" ] && has_default_on "$STA_IF"; then
+		m=wifi
+	fi
+	if [ "${1:-}" = '--json' ]; then
+		_J() { [ "$1" = 1 ] && printf true || printf false; }
+		printf '{"mode":"%s","wan_disabled":"%s","ap_disabled":"%s","sta_disabled":"%s","route_dev":"%s","sta_ssid":"%s","sta_ip":"%s","has_base":%s,"single_radio":%s}\n' \
+			"$m" "$w" "$a" "$s" "$dev" "$ssid" "$ip" \
+			"$([ -n "$(base_get prev_wan)" ] && echo 1 || echo 0)" "$(p single_radio)"
+		return 0
+	fi
+	say "模式：$m （wan=$w ap=$a sta=$s）"
+	say "默认路由：${dev:-无}"
+	[ -n "$ssid" ] && say "外部 Wi-Fi：$ssid ${ip:+($ip)}"
+	return 0
+}
+
+case "${1:-status}" in
+	status) shift 2>/dev/null; do_status "${1:-}" ;;
+	cell) do_cell ;;
+	wifi) do_wifi ;;
+	ap) do_ap ;;
+	restore) do_restore ;;
+	--check) "$PROBE" -p ;;
+	*) err '用法：airsim-netmode status [--json] | cell | wifi | ap | restore | --check'; exit 6 ;;
+esac

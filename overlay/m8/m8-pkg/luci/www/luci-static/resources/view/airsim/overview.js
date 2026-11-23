@@ -3,6 +3,7 @@
 'require rpc';
 'require poll';
 'require view.airsim.ui as ui';
+'require view.airsim.glass as glass';
 
 var getStatus = rpc.declare({ object: 'airsim', method: 'status', expect: {} });
 var callAction = rpc.declare({ object: 'airsim', method: 'call_action', params: ['action', 'number', 'call_id', 'operation_id', 'card'], expect: {}, reject: true, nobatch: true });
@@ -11,7 +12,7 @@ var getSims = rpc.declare({ object: 'airsim-sms', method: 'sms_sims', expect: {}
 // Paired-client pruning. The list is read-only metadata; removing entries is
 // destructive from the phone's point of view, so the UI confirms twice.
 var getPairClients = rpc.declare({ object: 'airsim', method: 'pair_clients', expect: {}, reject: true, nobatch: true });
-var removePairClients = rpc.declare({ object: 'airsim', method: 'pair_remove', params: ['indexes'], expect: {}, reject: true, nobatch: true });
+var removePairClients = rpc.declare({ object: 'airsim', method: 'pair_remove', params: ['ids'], expect: {}, reject: true, nobatch: true });
 var actions = {};
 ['start', 'stop', 'pair_start', 'pair_cancel', 'number_refresh'].forEach(function(name) {
  actions[name] = rpc.declare({ object: 'airsim', method: name, expect: {} });
@@ -28,7 +29,7 @@ function pairStamp(ts) {
 }
 
 function pairStateTag(client) {
- if (client.online) return E('span', { 'class': 'as-pair-time as-pair-online' }, '在线');
+ if (client.online || client.recent) return E('span', { 'class': 'as-pair-time as-pair-online' }, '在线');
  if (!client.last_used) return E('span', { 'class': 'as-pair-time' }, '尚未使用');
  return E('span', { 'class': 'as-pair-time' }, '上次 ' + pairStamp(client.last_used));
 }
@@ -80,17 +81,20 @@ function pairStepList(box, result) {
  box.appendChild(E('p', { 'class': 'as-copy as-modal-copy' }, '共 ' + clients.length + ' 个客户端已配对。勾选要删除的条目；删除后那台设备必须重新配对才能连接。'));
  var chosen = [], removeButton;
  var list = E('div', { 'class': 'as-pair-list' });
- clients.forEach(function(client) {
+ clients.forEach(function(client, pos) {
+  var cid = client.id || client.index;
+  var serial = client.index || (pos + 1);
+  var tail = client.fingerprint || (client.id || '').slice(-9);
   var check = E('input', { 'type': 'checkbox', 'class': 'as-pair-check' });
   check.addEventListener('change', function() {
-   var at = chosen.indexOf(client.index);
-   if (check.checked && at < 0) chosen.push(client.index);
+   var at = chosen.indexOf(cid);
+   if (check.checked && at < 0) chosen.push(cid);
    else if (!check.checked && at >= 0) chosen.splice(at, 1);
    removeButton.disabled = chosen.length === 0;
   });
   list.appendChild(E('label', { 'class': 'as-pair-item' }, [
    check,
-   E('span', { 'class': 'as-pair-main' }, '客户端 ' + client.index + ' · 密钥尾号 ' + client.fingerprint),
+   E('span', { 'class': 'as-pair-main' }, '客户端 ' + serial + ' · 密钥尾号 ' + tail),
    pairStateTag(client)
   ]));
  });
@@ -102,14 +106,16 @@ function pairStepList(box, result) {
 
 function pairStepConfirm(box, clients, chosen) {
  box.textContent = '';
- var targets = clients.filter(function(client) { return chosen.indexOf(client.index) >= 0; });
+ var targets = clients.filter(function(client) { return chosen.indexOf(client.id || client.index) >= 0; });
  box.appendChild(E('h3', {}, '确认删除这 ' + targets.length + ' 个客户端？'));
  box.appendChild(E('p', { 'class': 'as-copy as-modal-copy as-modal-warn' },
   '此操作不可恢复：删除后对应设备必须重新输入六位配对码才能再次连接。'));
  var list = E('div', { 'class': 'as-pair-list' });
  targets.forEach(function(client) {
+  var serial = client.index || (clients.indexOf(client) + 1);
+  var tail = client.fingerprint || (client.id || '').slice(-9);
   list.appendChild(E('div', { 'class': 'as-pair-item as-pair-item-static' }, [
-   E('span', { 'class': 'as-pair-main' }, '客户端 ' + client.index + ' · 密钥尾号 ' + client.fingerprint),
+   E('span', { 'class': 'as-pair-main' }, '客户端 ' + serial + ' · 密钥尾号 ' + tail),
    pairStateTag(client)
   ]));
  });
@@ -133,8 +139,20 @@ function pairStepConfirm(box, clients, chosen) {
 
 function pairStepDone(box, result) {
  box.textContent = '';
- box.appendChild(E('h3', {}, '已删除 ' + (result.removed || 0) + ' 个客户端'));
- box.appendChild(E('p', { 'class': 'as-copy as-modal-copy' }, '现在还有 ' + (result.total || 0) + ' 个已配对客户端。'));
+ // 后端拒绝时得把原因说出来。以前不看 ok，一律显示「已删除 0 个 / 现在还有 0 个」，
+ // 明明列表里还有客户端，人一看以为删干净了。
+ if (result && result.ok === false) {
+  box.appendChild(E('h3', {}, '没有删除'));
+  box.appendChild(E('p', { 'class': 'as-copy as-modal-copy as-modal-warn' },
+   result.error || '设备没有接受这次操作。'));
+  box.appendChild(E('div', { 'class': 'as-modal-actions' }, [pairButton('返回列表', 'as-secondary', pairClose)]));
+  return;
+ }
+ var removed = (result && result.removed) || 0;
+ var left = (result && typeof result.total === 'number') ? result.total : null;
+ box.appendChild(E('h3', {}, '已删除 ' + removed + ' 个客户端'));
+ box.appendChild(E('p', { 'class': 'as-copy as-modal-copy' },
+  left === null ? '删除已提交。' : ('现在还有 ' + left + ' 个已配对客户端。')));
  box.appendChild(E('div', { 'class': 'as-modal-actions' }, [pairButton('完成', 'as-secondary', pairClose)]));
 }
 
@@ -143,6 +161,8 @@ return view.extend({
  render: function(data) {
   ui.install();
   var current = data || {}, pending = '', previousVersion = '', callOptions = '', dialAttempt = null, simsState = null;
+  // 双卡逻辑保留：只有真的读到两张卡才显示“拨出卡”，单卡设备自动隐藏。
+  var multiSim = false;
   var root, nodes = {}, buttons = {};
   function text(key, tag, className, content) {
    nodes[key] = E(tag, { 'class': className || '' }, content || '');
@@ -279,6 +299,7 @@ return view.extend({
    return !!(sim && sim.present);
   }
   function dialCardLabel() {
+   if (!multiSim) return '本机 SIM 卡';
    var value = nodes.dialCard.value;
    return value === '0' ? 'SIM1' : value === '1' ? 'SIM2' : '所选卡';
   }
@@ -319,6 +340,9 @@ return view.extend({
   nodes.dialCard = E('select', { id: 'as-dial-card', 'class': 'as-call-select', change: function() { dialCardInit = true; syncCalls(current); } }, [
    E('option', { value: '0' }, 'SIM1'), E('option', { value: '1' }, 'SIM2')
   ]);
+  nodes.dialCardBlock = E('div', { 'class': 'as-dial-card-block' }, [
+   E('label', { 'for': 'as-dial-card', 'class': 'as-field-label' }, '拨出卡'), nodes.dialCard
+  ]);
   nodes.callSelect = E('select', { id: 'as-call-select', 'class': 'as-call-select', change: function() { syncCalls(current); } }, [E('option', { value: '' }, '当前没有通话')]);
   var dialCardInit = false;
   var simsLine = E('p', { 'class': 'as-caption as-sims-line' }, '正在读取两张 SIM 卡…');
@@ -326,6 +350,8 @@ return view.extend({
    try {
     var r = await getSims();
     if (!r || !Array.isArray(r.sims)) return;
+    multiSim = r.sims.length > 1;
+    if (nodes.dialCardBlock) nodes.dialCardBlock.style.display = multiSim ? '' : 'none';
     var present = r.sims.filter(function(s) { return s && s.present; });
     simsLine.textContent = present.length
      ? '在位卡：' + present.map(function(s) {
@@ -362,6 +388,8 @@ return view.extend({
   }
   root = E('div', { 'class': 'as-root' }, [
    ui.stylesheet(),
+   E('style', {}, glass.css()),
+   (ui.menu ? ui.menu('overview') : ''),
    E('header', { 'class': 'as-header' }, [E('div', {}, [E('div', { 'class': 'as-eyebrow' }, 'AirSIM · 电话网关'), E('h2', {}, '让连接，简单一点。'), E('p', {}, 'VIPME-M8 的运行状态与客户端连接，在这里管理。')]), text('version', 'span', 'as-version')]),
    E('div', { 'class': 'as-layout' }, [
     E('section', { 'class': 'as-card as-status', 'aria-label': '设备状态' }, [
@@ -389,7 +417,7 @@ return view.extend({
     E('section', { 'class': 'as-card as-dial', 'aria-label': '拨号与通话' }, [
      E('div', { 'class': 'as-step-heading' }, [E('span', { 'class': 'as-step' }, '03'), E('h3', {}, '拨号与通话')]),
      E('p', { 'class': 'as-copy' }, '使用 VIPME-M8 的 SIM 卡发起电话。'),
-     E('label', { 'for': 'as-dial-card', 'class': 'as-field-label' }, '拨出卡'), nodes.dialCard,
+     nodes.dialCardBlock,
      E('label', { 'for': 'as-dial-number', 'class': 'as-field-label' }, '拨打号码'),
      E('div', { 'class': 'as-dial-entry' }, [nodes.dialNumber, button('拨号', 'dial', 'as-primary')]),
      E('p', { id: 'as-dial-help', 'class': 'as-caption' }, '可能产生运营商通话费用。本页仅控制通话，不提供浏览器音频。'),

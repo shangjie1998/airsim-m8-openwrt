@@ -14,3 +14,6 @@
 *.pcm
 *.wav
 *.pcap
+
+# 本地构建产物（agent 源码暂存 + arm64 二进制），随 tarball 发布，不进 git
+/overlay/m8/out/

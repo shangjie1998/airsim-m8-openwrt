@@ -1,7 +1,7 @@
 'use strict';
 'require baseclass';
 
-/* 外观状态（主题 / 密度 / 透明度）全在这一处，存在 localStorage，四页共用。
+/* 外观状态（主题 / 密度 / 透明度）全在这一处，存在 localStorage，六页共用。
  * 页面只要 require 这个模块并在 render 开头调 ui.install()，就会自动套用
  * 上次选好的外观；设置页通过 set* 改，改完通知所有监听者更新按钮态。 */
 
@@ -84,9 +84,72 @@ function install() {
 
 /* 页面统一用这个挂样式表，路径只写一次。
  * ui.css 改了要跟着改样式版本号，否则浏览器会一直吃旧缓存（这坑踩过两次）。 */
-var CSSVERSION = '20261109';
+var CSSVERSION = '20261123';
 function stylesheet(name) {
  return E('link', { 'rel': 'stylesheet', 'href': L.resource('view/airsim/' + (name || 'ui.css')) + '?v=' + CSSVERSION });
+}
+
+/* ---------------- 顶部菜单（我们自己接管） ----------------
+ * 宽屏一行平铺、放不下就折行；窄屏（<=520）整条换成下拉。
+ * 主题那边同名的 .sidebar-submenu / .mobile-nav-submenu 在 ui.css 里按页面前缀关掉了。
+ */
+var PAGES = [
+ { id: 'overview',    title: '设备概览' },
+ { id: 'connect',     title: '连接' },
+ { id: 'net',         title: '联网' },
+ { id: 'call',        title: '来电通知' },
+ { id: 'sms',         title: '短信' },
+ { id: 'maintenance', title: '维护' },
+ { id: 'settings',    title: '设置' }
+];
+
+/* 链接一律交给 L.url 生成：它知道 /cgi-bin/luci 这层前缀和实际脚本名。 */
+function menu(current) {
+ current = current || '';
+ var base = L.url('admin/services/airsim');
+ var items = [];
+
+ PAGES.forEach(function(page) {
+  var active = page.id === current;
+  items.push(E('a', {
+   'class': 'as-menu-item' + (active ? ' is-active' : ''),
+   'href': base + '/' + page.id,
+   'aria-current': active ? 'page' : null
+  }, page.title));
+ });
+
+ try { document.body.classList.add('as-menu-on'); } catch (e) { /* 忽略 */ }
+
+ var picker = E('select', { 'class': 'as-input as-menu-select', 'aria-label': '切换到其它页面' },
+  PAGES.map(function(page) {
+   return E('option', { 'value': base + '/' + page.id, 'selected': page.id === current ? '' : null }, page.title);
+  })
+ );
+ picker.addEventListener('change', function() {
+  if (picker.value) window.location.href = picker.value;
+ });
+
+ return E('nav', { 'class': 'as-menu', 'aria-label': 'AirSIM 页面' }, [
+  E('div', { 'class': 'as-menu-strip' }, items),
+  E('div', { 'class': 'as-menu-narrow' }, [ picker ])
+ ]);
+}
+
+/* 字段封装：视觉标签和真实 <label for> 一次生成。
+ * node 必须有 id，没有就按顺序补一个；有 help 时挂成 aria-describedby。 */
+var fieldSeq = 0;
+var dialogSeq = 0;
+function field(labelText, node, help) {
+ if (!node) return null;
+ if (!node.id) { fieldSeq += 1; node.id = 'as-f-' + fieldSeq; }
+ var label = E('label', { 'for': node.id, 'class': 'as-field-label' }, labelText);
+ var kids = [label, node];
+ if (help) {
+  var helpId = node.id + '-help';
+  node.setAttribute('aria-describedby', helpId);
+  kids.push(E('p', { 'class': 'as-caption', 'id': helpId }, help));
+ }
+ return E('div', { 'class': 'as-setting' }, kids);
 }
 
 /* 确认框：替代 vendor 模块的 confirmBox，样式走 ui.css 的 .as-modal。
@@ -95,11 +158,12 @@ function dialog(title, message, opts) {
  opts = opts || {};
  return new Promise(function(resolve) {
   var settled = false;
+  var titleId = 'as-dlg-title-' + (dialogSeq += 1);
   var ok = E('button', { 'type': 'button', 'class': 'as-button' + (opts.danger ? ' as-danger' : '') }, opts.okText || '确定');
   var cancel = E('button', { 'type': 'button', 'class': 'as-button' }, opts.cancelText || '取消');
   var mask = E('div', { 'class': 'as-modal-mask' }, [
-   E('div', { 'class': 'as-modal', 'role': 'dialog', 'aria-modal': 'true' }, [
-    E('h3', {}, title),
+   E('div', { 'class': 'as-modal', 'role': 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId }, [
+    E('h3', { 'id': titleId }, title),
     E('p', { 'class': 'as-copy as-modal-copy' }, message || ''),
     E('div', { 'class': 'as-modal-actions' }, opts.okOnly ? [ok] : [cancel, ok])
    ])
@@ -155,12 +219,22 @@ function busy(button, flag) {
  else button.classList.remove('is-busy');
 }
 
+/* 时间戳戳：秒级 epoch → MM-DD HH:MM */
+function stampEpoch(epoch) {
+ var n = Number(epoch || 0);
+ if (!n) return '';
+ var d = new Date(n * 1000), p2 = function(x) { return (x < 10 ? '0' : '') + x; };
+ return p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+}
+
 return baseclass.extend({
  install: install,
  paint: paint,
  subscribe: subscribe,
  stylesheet: stylesheet,
+ menu: menu,
  dialog: dialog,
+ field: field,
  toast: toast,
  busy: busy,
  getMode: function() { return parse().mode; },
@@ -169,5 +243,6 @@ return baseclass.extend({
  setMode: setMode,
  setDensity: setDensity,
  setTransparency: setTransparency,
- isDark: function() { return isDark(parse()); }
+ isDark: function() { return isDark(parse()); },
+ stampEpoch: stampEpoch
 });

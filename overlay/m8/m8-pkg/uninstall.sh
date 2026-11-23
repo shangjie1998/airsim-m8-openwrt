@@ -41,12 +41,23 @@ say "== removing LuCI menu (ours only)"
 rm -f /usr/libexec/rpcd/airsim
 rm -f /usr/libexec/rpcd/airsim-call
 rm -f /usr/libexec/rpcd/airsim-sms
+rm -f /usr/libexec/rpcd/airsim-bt
+rm -f /usr/libexec/rpcd/airsim-net
+rm -f /usr/bin/airsim-netmode
+rm -f /usr/libexec/airsim-net-probe
+rm -f /usr/libexec/airsim-flowfix
 rm -f /usr/share/luci/menu.d/luci-app-airsim.json
 rm -f /usr/share/rpcd/acl.d/luci-app-airsim.json
 rm -f /www/luci-static/resources/view/airsim/overview.js \
-	/www/luci-static/resources/view/airsim/manage.js \
+	/www/luci-static/resources/view/airsim/connect.js \
+	/www/luci-static/resources/view/airsim/net.js \
+	/www/luci-static/resources/view/airsim/call.js \
 	/www/luci-static/resources/view/airsim/sms.js \
-	/www/luci-static/resources/view/airsim/overview.css
+	/www/luci-static/resources/view/airsim/maintenance.js \
+	/www/luci-static/resources/view/airsim/settings.js \
+	/www/luci-static/resources/view/airsim/ui.css \
+	/www/luci-static/resources/view/airsim/ui.js \
+	/www/luci-static/resources/view/airsim/glass.js
 rmdir /www/luci-static/resources/view/airsim 2>/dev/null || true
 rm -f /etc/config/airsim
 /etc/init.d/rpcd restart >/dev/null 2>&1 || true

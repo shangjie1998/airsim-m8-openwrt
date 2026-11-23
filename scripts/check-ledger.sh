@@ -17,6 +17,7 @@ MISSING=0
 for f in $(cd "$OVERLAY" && find . -type f | sed 's|^\./||' | sort); do
 	case "$f" in
 	.*|*/.*) continue ;;
+	out/*) continue ;;
 	docs/M8-CHANGE-LEDGER.md|docs/M8-FEATURE-GOVERNANCE.md|VERSION|m8-pkg/VERSION) continue ;;
 	esac
 	if ! grep -qF "$(basename "$f")" "$LEDGER"; then

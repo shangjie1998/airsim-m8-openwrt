@@ -3,6 +3,7 @@
 'require poll';
 'require rpc';
 'require view.airsim.ui as ui';
+'require view.airsim.glass as glass';
 
 /* 来电通知：跟短信转发共用一条投递渠道，不碰 modem。
  * 页面自己渲染，不再依赖设备上的 vendor 共享模块（mu300.common）。 */
@@ -70,7 +71,7 @@ return view.extend({
   var channelLine = E('p', { 'class': 'as-caption' }, '—');
   var sourceNote = E('p', { 'class': 'as-caption' }, '');
   var history = E('div', { 'class': 'as-history', 'tabindex': '0', 'aria-label': '最近投递记录' });
-  var savedHint = E('p', { 'class': 'as-caption' }, '');
+  var savedHint = E('p', { 'class': 'as-caption', 'role': 'status', 'aria-live': 'polite' }, '');
 
   var sourceSelect = select('source', [['sms', '跟随短信转发（推荐）'], ['own', '本页单独配置']]);
   var presetSelect = select('preset', [['', '自定义 / 兼容旧版'], ['json', 'JSON Webhook'], ['bark', 'Bark'], ['pushplus', 'PushPlus'], ['serverchan', 'ServerChan'], ['telegram', 'Telegram'], ['wecom', '企业微信'], ['dingtalk', '钉钉 Webhook']]);
@@ -83,7 +84,14 @@ return view.extend({
   var headersArea = E('textarea', { 'id': 'as-call-headers', 'rows': '3', 'class': 'as-textarea', 'autocomplete': 'off', 'spellcheck': 'false' });
   var bodyArea = E('textarea', { 'id': 'as-call-body', 'rows': '6', 'class': 'as-textarea', 'spellcheck': 'false' });
 
-  var enabled = E('input', { 'type': 'checkbox', 'id': 'as-call-enabled' });
+  /* 「启用来电通知」换成滑块。原生复选框留成隐藏真值源，
+   * 页面里别的逻辑（取值/填表/校验）一行不动，开关只负责把 checked 拨过去。 */
+  var enabled = E('input', { 'type': 'checkbox', 'id': 'as-call-enabled', 'hidden': true });
+  var enabledSwitch = glass.switch(false, function(next) {
+   enabled.checked = next;
+   glass.switchSet(enabledSwitch, next);
+   enabled.dispatchEvent(new Event('change'));
+  }, '启用来电通知');
   var notifyRinging = E('input', { 'type': 'checkbox', 'id': 'as-call-notify_ringing' });
   var notifyAnswered = E('input', { 'type': 'checkbox', 'id': 'as-call-notify_answered' });
   var notifyEnded = E('input', { 'type': 'checkbox', 'id': 'as-call-notify_ended' });
@@ -109,6 +117,8 @@ return view.extend({
 
   var root = E('div', { 'class': 'as-root' }, [
    ui.stylesheet(),
+   E('style', {}, glass.css()),
+   (ui.menu ? ui.menu('call') : ''),
    E('header', { 'class': 'as-header' }, [
     E('div', {}, [E('div', { 'class': 'as-eyebrow' }, 'AirSIM · 来电通知'), E('h2', {}, '来电话，第一时间知道。'), E('p', {}, '来电、接通、挂断、漏接，按你选的渠道推出去。')]),
     statePill
@@ -121,7 +131,10 @@ return view.extend({
      field('preset', '填入推送预设', presetSelect, '预设只填表单，密钥要换成自己的再保存。'),
      sourceNote,
      E('hr', {}),
-     E('label', { 'class': 'as-check', 'for': 'as-call-enabled' }, [enabled, E('span', {}, '启用来电通知')]),
+     E('div', { 'class': 'as-switch-row', 'click': function(ev) {
+      if (ev.target === enabledSwitch || enabledSwitch.contains(ev.target)) return;
+      glass.switchToggle(enabledSwitch);
+     } }, [enabledSwitch, enabled, E('span', {}, '启用来电通知')]),
      E('p', { 'class': 'as-caption' }, '关掉后不再推任何通话事件，转发服务照常运行，随时能再打开。')
     ]),
     E('section', { 'class': 'as-card' }, [
@@ -164,6 +177,7 @@ return view.extend({
    ['enabled', 'notify_ringing', 'notify_answered', 'notify_ended', 'notify_missed'].forEach(function(k) {
     q(k).checked = c[k] === '1' || c[k] === 1 || (c[k] === '' && (k === 'notify_ringing' || k === 'notify_ended' || k === 'notify_missed'));
    });
+   glass.switchSet(enabledSwitch, q('enabled').checked);
    urlInput.value = c.url || '';
    methodSelect.value = c.method || 'POST';
    typeSelect.value = c.content_type || 'application/json';

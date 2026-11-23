@@ -2,6 +2,7 @@
 'require view';
 'require rpc';
 'require view.airsim.ui as ui';
+'require view.airsim.glass as glass';
 
 var getStatus = rpc.declare({ object: 'airsim', method: 'status', expect: {} });
 /* 蓝牙开关走 airsim-bt：逻辑在设备上，机型差异只在 /etc/config/airsim-bt */
@@ -120,6 +121,8 @@ return view.extend({
 
   return E('div', { 'class': 'as-root' }, [
    ui.stylesheet(),
+   E('style', {}, glass.css()),
+   (ui.menu ? ui.menu('settings') : ''),
    E('header', { 'class': 'as-header' }, [
     E('div', {}, [E('div', { 'class': 'as-eyebrow' }, 'AirSIM · 设置'), E('h2', {}, '按你的习惯来。'), E('p', {}, '外观与显示偏好，只影响这台设备的网页界面。')]),
     E('span', { 'class': 'as-version' }, version)

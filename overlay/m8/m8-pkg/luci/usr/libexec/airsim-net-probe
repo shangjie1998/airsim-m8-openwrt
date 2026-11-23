@@ -1,0 +1,242 @@
+#!/usr/bin/env sh
+# AirSIM 联网能力探测（只读，绝不改任何配置）
+#
+# 作用：把"这台机器到底允许做什么"探出来，交给切换脚本、页面、安装脚本共用。
+# 原则：所有判断都按机器真实配置得出，不写死具体机型的值 —— 作者以后改了
+#       无线段名、频段或防火墙分区，这里跟着变，上层不会瞎改。
+#
+# 用法：
+#   airsim-net-probe            输出 JSON（一行）
+#   airsim-net-probe -p         输出 key=value（方便 sh 里取用）
+#   airsim-net-probe -k <name>  只输出某一项的值
+# 退出码：0 正常；2 uci 不可用；3 管理口结构不符预期（调用方应停止切换）
+set -u
+
+MODE=json
+KEY=
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-p) MODE=kv ;;
+		-k) MODE=key; KEY=${2:-}; shift ;;
+		*) echo "未知参数：$1" >&2; exit 1 ;;
+	esac
+	shift
+done
+
+command -v uci >/dev/null 2>&1 || { [ "$MODE" = json ] && echo '{"ok":false,"err":"no-uci"}'; exit 2; }
+
+u() { uci -q get "$1" 2>/dev/null; }
+
+# ---- 1. 无线硬件段：挑真正是 wifi-device 的那个，不写死 radio0 ----
+RADIO=$(uci show wireless 2>/dev/null | grep '=wifi-device' | head -1 | sed 's/wireless\.//;s/=.*//')
+[ -n "$RADIO" ] || RADIO=radio0
+
+BAND=$(u wireless.$RADIO.band)
+CHANNEL=$(u wireless.$RADIO.channel)
+HTMODE=$(u wireless.$RADIO.htmode)
+CHANNELS=$(u wireless.$RADIO.channels)
+COUNTRY=$(u wireless.$RADIO.country)
+NOSCAN=$(u wireless.$RADIO.noscan)
+
+# ---- 2. 两个 wifi-iface：STA 与 AP ----
+STA=; AP=
+for s in $(uci show wireless 2>/dev/null | grep '=wifi-iface' | sed 's/wireless\.//;s/=.*//'); do
+	case "$(u wireless.$s.mode)" in
+		sta) [ -n "$STA" ] || STA=$s ;;
+		ap)  [ -n "$AP" ]  || AP=$s ;;
+	esac
+done
+[ -n "$STA" ] || STA=wwan0
+[ -n "$AP" ]  || AP=ap0
+
+AP_IF=$(u wireless.$AP.ifname)
+STA_IF=$(u wireless.$STA.ifname)
+STA_DEV=$(u wireless.$STA.device)
+AP_DEV=$(u wireless.$AP.device)
+# STA 段绑到哪个 network 接口（默认 wwan）。后面读 proto/metric/disabled、判断
+# 防火墙归属都按这个名，不写死 —— 哪天 STA 改绑别的 network 段，这里跟着变。
+STA_NET=$(u wireless.$STA.network)
+[ -n "$STA_NET" ] || STA_NET=wwan
+[ -n "$AP_IF" ] || AP_IF=wlan0
+
+# 同一个 ifname 或同一个 device => 单射频，AP 与 STA 物理互斥
+if { [ -n "$AP_IF" ] && [ "$AP_IF" = "$STA_IF" ]; } || { [ -n "$AP_DEV" ] && [ "$AP_DEV" = "$STA_DEV" ]; }; then
+	SINGLE=1
+else
+	SINGLE=0
+fi
+
+# phy 里真实的接口名（AP 关着时可能根本没有这个 netdev）
+# 原来用 `iw dev`，实测这一条就占 0.41 秒（整个探测 0.5 秒基本都花在这）。
+# 改成看 sysfs：哪个 netdev 底下挂着 phy80211 就是无线口，几毫秒出结果。
+LIVE_IF=''
+for _n in $(ls /sys/class/net 2>/dev/null); do
+	if [ -e "/sys/class/net/$_n/phy80211" ]; then LIVE_IF=$_n; break; fi
+done
+
+# ---- 3. 频段能力：机器说什么就是什么 ----
+case "$BAND" in
+	2g)   BANDS='2.4G' ;;
+	5g)   BANDS='5G' ;;
+	6g)   BANDS='6G' ;;
+	*band*) BANDS='unknown' ;;
+	*)    BANDS='5G' ;;
+esac
+# 芯片实际是否有两个以上频段（有就说明 band 只是被配置限住，不是硬件没有）
+BAND_COUNT=$(iw phy phy0 info 2>/dev/null | grep -c 'Band ')
+[ -n "$BAND_COUNT" ] || BAND_COUNT=0
+# phy 实际支持哪些频段（24g/5g/6g），按频率段判；uci band 可能只写了当前 AP 用的那段
+PHY_BANDS=$(iw phy phy0 info 2>/dev/null | awk '
+	/MHz/ {
+		if ($0 ~ /2[0-9]{3}\.[0-9]+ MHz/) b="24g"
+		else if ($0 ~ /5[0-9]{3}\.[0-9]+ MHz/) b="5g"
+		else if ($0 ~ /6[0-9]{3}\.[0-9]+ MHz/) b="6g"
+		else next
+		seen[b]=1
+	}
+	END { for (k in seen) printf "%s ", k }')
+PHY_BANDS=$(echo $PHY_BANDS)
+# 多频段时机顶标签按双频报，单频段沿用 uci band 文案
+if [ "$BAND_COUNT" -gt 1 ]; then BANDS='双频'; fi
+
+# ---- 4. 网络接口 ----
+WAN_PROTO=$(u network.wan.proto)
+WAN_DIS=$(u network.wan.disabled)
+WWAN_PROTO=$(u network.$STA_NET.proto)
+WWAN_METRIC=$(u network.$STA_NET.metric)
+WWAN_DIS=$(u network.$STA_NET.disabled)
+AP_DIS=$(u wireless.$AP.disabled)
+STA_DIS=$(u wireless.$STA.disabled)
+
+# ---- 5. 客户端能不能经无线出网：STA 接口有没有被某个 firewall zone 收录 ----
+EGRESS=0
+for z in $(uci show firewall 2>/dev/null | grep '=zone' | sed 's/firewall\.//;s/=.*//'); do
+	case "$z" in
+		@*|zone_*) ;;
+		*) continue ;;
+	esac
+	for n in $(uci -q get firewall.$z.network 2>/dev/null); do
+		[ "$n" = "$STA_NET" ] && EGRESS=1
+	done
+done
+NFT_HIT=$(nft list ruleset 2>/dev/null | grep -c "$AP_IF")
+[ -n "$NFT_HIT" ] || NFT_HIT=0
+
+# ---- 6. 管理口（只校验，不改）----
+LAN_IP=$(u network.lan.ipaddr)
+# M8 的 uci network.@device[0].ports 可能为空（桥口在运行时才挂），
+# 不能只看配置；改走 brctl 运行时成员表，跟真机一致。
+BR_PORTS=''
+if command -v brctl >/dev/null 2>&1; then
+	BR_PORTS=$(brctl show br-lan 2>/dev/null | awk 'NR>1 && $4 {printf "%s ", $4}' | tr -s ' ')
+fi
+# 只校验"结构还在"：lan 有地址 + br-lan 端口里挂着 usb0。
+# 不比对具体 IP —— 管理地址是配置值（network.lan.ipaddr），不是常量；
+# 哪天改成别的网段，硬比 192.168.9.1 会把正常配置判成"管理口丢了"而拒绝切换。
+LAN_OK=0
+if [ -n "$LAN_IP" ] && echo " $BR_PORTS " | grep -q " usb0 "; then
+	LAN_OK=1
+fi
+
+# ---- 7. 工具链 ----
+T_IWINFO=0; T_AT=0; T_NETMODE=0
+command -v iwinfo >/dev/null 2>&1 && T_IWINFO=1
+command -v mu300-at >/dev/null 2>&1 && T_AT=1
+[ -x /usr/bin/airsim-netmode ] && T_NETMODE=1
+
+# ---- 8. 蜂窝出口网卡名 ----
+# 蜂窝口名：mu300cell 类固件固定 sipa_eth0；M8 走 modemmanager，口名由
+# netifd 的 l3_device 给出，取不到再回退 sipa_eth0。
+CELL_IF=''
+case "$WAN_PROTO" in
+	mu300cell) CELL_IF=sipa_eth0 ;;
+	modemmanager|qmi|mbim|ncm|dhcp)
+		CELL_IF=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+		[ -z "$CELL_IF" ] && CELL_IF=sipa_eth0
+		;;
+esac
+
+# ---- 输出 ----
+if [ "$MODE" = key ]; then
+	case "$KEY" in
+		radio) echo "$RADIO" ;;
+		band) echo "$BAND" ;;
+		band_label) echo "$BANDS" ;;
+		channel) echo "$CHANNEL" ;;
+		htmode) echo "$HTMODE" ;;
+		channels) echo "$CHANNELS" ;;
+		country) echo "$COUNTRY" ;;
+		noscan) echo "$NOSCAN" ;;
+		sta_section) echo "$STA" ;;
+		ap_section) echo "$AP" ;;
+		sta_if) echo "$STA_IF" ;;
+		ap_if) echo "$AP_IF" ;;
+		live_if) echo "$LIVE_IF" ;;
+		single_radio) echo "$SINGLE" ;;
+		client_egress) echo "$EGRESS" ;;
+		wan_proto) echo "$WAN_PROTO" ;;
+		wan_disabled) echo "$WAN_DIS" ;;
+		wwan_proto) echo "$WWAN_PROTO" ;;
+		wwan_metric) echo "$WWAN_METRIC" ;;
+		wwan_disabled) echo "$WWAN_DIS" ;;
+		ap_disabled) echo "$AP_DIS" ;;
+		sta_disabled) echo "$STA_DIS" ;;
+		lan_ip) echo "$LAN_IP" ;;
+		lan_ok) echo "$LAN_OK" ;;
+		br_ports) echo "$BR_PORTS" ;;
+		has_iwinfo) echo "$T_IWINFO" ;;
+		has_mu300at) echo "$T_AT" ;;
+		has_netmode) echo "$T_NETMODE" ;;
+		cell_if) echo "$CELL_IF" ;;
+		band_count) echo "$BAND_COUNT" ;;
+		bands) echo "$PHY_BANDS" ;;
+		nft_hit) echo "$NFT_HIT" ;;
+		*) exit 4 ;;
+	esac
+	exit 0
+fi
+
+if [ "$MODE" = kv ]; then
+	cat <<EOF
+radio=$RADIO
+band=$BAND
+band_label=$BANDS
+band_count=$BAND_COUNT
+bands=$PHY_BANDS
+channel=$CHANNEL
+htmode=$HTMODE
+channels=$CHANNELS
+country=$COUNTRY
+noscan=$NOSCAN
+sta_section=$STA
+ap_section=$AP
+sta_if=$STA_IF
+ap_if=$AP_IF
+live_if=$LIVE_IF
+single_radio=$SINGLE
+client_egress=$EGRESS
+nft_hit=$NFT_HIT
+wan_proto=$WAN_PROTO
+wan_disabled=$WAN_DIS
+wwan_proto=$WWAN_PROTO
+wwan_metric=$WWAN_METRIC
+wwan_disabled=$WWAN_DIS
+ap_disabled=$AP_DIS
+sta_disabled=$STA_DIS
+lan_ip=$LAN_IP
+lan_ok=$LAN_OK
+br_ports=$BR_PORTS
+has_iwinfo=$T_IWINFO
+has_mu300at=$T_AT
+has_netmode=$T_NETMODE
+cell_if=$CELL_IF
+EOF
+	exit 0
+fi
+
+# JSON（值来自 uci / 系统，不含引号反斜杠，直接拼）
+_N() { [ "$1" = 1 ] && printf true || printf false; }
+cat <<EOF
+{"ok":true,"radio":"$RADIO","band":"$BAND","band_label":"$BANDS","band_count":$BAND_COUNT,"bands":"$PHY_BANDS","channel":"$CHANNEL","htmode":"$HTMODE","channels":"$CHANNELS","country":"$COUNTRY","noscan":$(_N "$([ "${NOSCAN:-0}" = 1 ] && echo 1 || echo 0)"),"sta_section":"$STA","ap_section":"$AP","sta_if":"$STA_IF","ap_if":"$AP_IF","live_if":"$LIVE_IF","single_radio":$(_N "$SINGLE"),"client_egress":$(_N "$EGRESS"),"nft_hit":$NFT_HIT,"wan_proto":"$WAN_PROTO","wan_disabled":"$WAN_DIS","wwan_proto":"$WWAN_PROTO","wwan_metric":"$WWAN_METRIC","wwan_disabled":"$WWAN_DIS","ap_disabled":"$AP_DIS","sta_disabled":"$STA_DIS","lan_ip":"$LAN_IP","lan_ok":$(_N "$LAN_OK"),"br_ports":"$BR_PORTS","has_iwinfo":$T_IWINFO,"has_mu300at":$T_AT,"has_netmode":$(_N "$T_NETMODE"),"cell_if":"$CELL_IF"}
+EOF
+exit 0

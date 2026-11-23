@@ -1,0 +1,13 @@
+# M8 Agent 补丁登记表。prepare-agent.sh（构建）与 check-patches.py（体检）都只认这张表。
+#
+# 列：补丁文件	状态	标记串（逗号分隔，全部必须出现在打完后源码里）
+#
+# 状态取值：
+#   active   —— 构建时必须按顺序打进去，打不上就构建失败，不许静默跳过
+#   merged   —— 功能已直接合并进基线，构建时不打；但标记串必须仍在源码里找得到
+#
+# 顺序即应用顺序，不要随意调换：后面的补丁可能依赖前面的上下文。
+AirSIM-mu300.patch	active	mu300ControlSnapshot,mu300CloudEarlyMediaStatus
+AirSIM-e164.patch	active	normalizeSelfNumber,decodeMaybeUCS2
+AirSIM-m8-sms-callfix.patch	active	hangup,answer
+AirSIM-m8-fast-hangup.patch	active	callRefreshNow

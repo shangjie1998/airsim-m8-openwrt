@@ -14,8 +14,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,6 +44,13 @@ type daemon struct {
 	callMu        sync.Mutex
 	gateway       *gateway.Gateway
 	settings      managementSettings
+	ctx           context.Context
+	netMu         sync.Mutex
+	pairListener  net.Listener
+	ctrlListener  net.Listener
+	pcmListener   net.Listener
+	pairServer    *http.Server
+	ctrlServer    *http.Server
 }
 
 func main() {
@@ -158,27 +167,20 @@ func main() {
 	if e != nil {
 		log.Fatal(e)
 	}
+	d.ctx = ctx
 	gwAd, e := zeroconf.Register("AirSIM-VIPME-M8-"+id[len(id)-8:], "_airsim-vowlan._tcp", "local.", settings.ControlPort,
 		[]string{"v=1", "agent_id=" + id, "agent_kind=mu300", "device_name=AirSIM VIPME-M8", "manufacturer=ZTE", "model=VIPME-M8", "host=" + lan, "control_port=" + portText(settings.ControlPort), "pcm_port=" + portText(settings.PCMPort), "caps=control,pcm"}, []net.Interface{*lanInterface})
 	if e != nil {
 		log.Fatal(e)
 	}
 	defer gwAd.Shutdown()
-	pcmListener, e := net.Listen("tcp", net.JoinHostPort(lan, portText(settings.PCMPort)))
+	d.advertisement = gwAd
+	d.pcmListener, e = net.Listen("tcp", net.JoinHostPort(lan, portText(settings.PCMPort)))
 	if e != nil {
 		log.Fatal(e)
 	}
-	defer pcmListener.Close()
-	go func() { <-ctx.Done(); pcmListener.Close() }()
-	go func() {
-		for {
-			c, err := pcmListener.Accept()
-			if err != nil {
-				return
-			}
-			go d.gateway.ServePCM(ctx, c)
-		}
-	}()
+	defer d.pcmListener.Close()
+	go d.servePCM(ctx, d.pcmListener)
 	listener, e := net.Listen("tcp", "127.0.0.1:7580")
 	if e != nil {
 		log.Fatal(e)
@@ -205,30 +207,52 @@ func main() {
 	admin.HandleFunc("/pair/start", d.startPair)
 	admin.HandleFunc("/pair/cancel", d.cancelPair)
 	admin.HandleFunc("/pair/clients", d.pairClients)
-	admin.HandleFunc("/pair/remove", d.pairRemove)
+	admin.HandleFunc("/pair/remove", d.removePairClient)
 	admin.HandleFunc("/number/refresh", d.refreshNumber)
 	admin.HandleFunc("/call/action", d.callAction)
+	// 运行期重绑：切到外部 Wi-Fi 上行后，把 pair/control/PCM 监听与 Bonjour 广告
+	// 搬到新地址。只绑 127.0.0.1，外部不可达；由 rpcd airsim-net 内部调用。
+	admin.HandleFunc("/rebind", d.rebind)
 	public := http.NewServeMux()
 	public.HandleFunc("/pair/v1/info", d.pairInfo)
 	public.HandleFunc("/pair/v1/claim", d.claim)
-	servers := []*http.Server{{Addr: "127.0.0.1:7581", Handler: admin, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 45 * time.Second, MaxHeaderBytes: 8192}, {Addr: net.JoinHostPort(lan, portText(settings.PairPort)), Handler: public, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, MaxHeaderBytes: 8192}}
-	servers = append(servers, &http.Server{Addr: net.JoinHostPort(lan, portText(settings.ControlPort)), Handler: d.gateway, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 80 * time.Second, MaxHeaderBytes: 8192})
-	for _, server := range servers {
-		go func(s *http.Server) {
-			if e := s.ListenAndServe(); e != nil && !errors.Is(e, http.ErrServerClosed) {
-				log.Printf("listener failed: %s", s.Addr)
-				cancel()
-			}
-		}(server)
+	adminServer := &http.Server{Addr: "127.0.0.1:7581", Handler: admin, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 45 * time.Second, MaxHeaderBytes: 8192}
+	d.pairServer = &http.Server{Addr: net.JoinHostPort(lan, portText(settings.PairPort)), Handler: public, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, MaxHeaderBytes: 8192}
+	d.ctrlServer = &http.Server{Addr: net.JoinHostPort(lan, portText(settings.ControlPort)), Handler: d.gateway, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 80 * time.Second, MaxHeaderBytes: 8192}
+	d.pairListener, e = net.Listen("tcp", d.pairServer.Addr)
+	if e != nil {
+		log.Fatal(e)
 	}
+	d.ctrlListener, e = net.Listen("tcp", d.ctrlServer.Addr)
+	if e != nil {
+		log.Fatal(e)
+	}
+	go func() {
+		if e := adminServer.ListenAndServe(); e != nil && !errors.Is(e, http.ErrServerClosed) {
+			log.Printf("admin listener failed: %s", adminServer.Addr)
+			cancel()
+		}
+	}()
+	go func() {
+		if e := d.pairServer.Serve(d.pairListener); e != nil && !errors.Is(e, http.ErrServerClosed) {
+			log.Printf("pair listener failed: %s", d.pairServer.Addr)
+			cancel()
+		}
+	}()
+	go func() {
+		if e := d.ctrlServer.Serve(d.ctrlListener); e != nil && !errors.Is(e, http.ErrServerClosed) {
+			log.Printf("control listener failed: %s", d.ctrlServer.Addr)
+			cancel()
+		}
+	}()
 	log.Printf("VIPME-M8 plugin ready; pairing port %d", settings.PairPort)
 	<-ctx.Done()
 	d.closePair("")
-	for _, s := range servers {
-		s.Close()
-	}
+	adminServer.Close()
+	d.pairServer.Close()
+	d.ctrlServer.Close()
 	listener.Close()
-	pcmListener.Close()
+	d.pcmListener.Close()
 	d.gateway.Shutdown()
 	<-acceptedDone
 	sessions.Wait()
@@ -261,6 +285,168 @@ func lanAddress(name string) (string, error) {
 	}
 	return "", fmt.Errorf("no private IPv4 on %s", name)
 }
+
+// servePCM 接 PCM 直连；监听被替换时旧 Accept 循环随旧 listener 退出。
+func (d *daemon) servePCM(ctx context.Context, l net.Listener) {
+	go func() { <-ctx.Done(); l.Close() }()
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		go d.gateway.ServePCM(ctx, c)
+	}
+}
+
+func privateIPv4(ifc *net.Interface) (string, error) {
+	addrs, e := ifc.Addrs()
+	if e != nil {
+		return "", e
+	}
+	for _, a := range addrs {
+		ip, _, _ := net.ParseCIDR(a.String())
+		if ip.To4() != nil && ip.IsPrivate() {
+			return ip.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no private IPv4 on %s", ifc.Name)
+}
+
+func interfaceForIP(ip net.IP) (*net.Interface, error) {
+	ifcs, e := net.Interfaces()
+	if e != nil {
+		return nil, e
+	}
+	for i := range ifcs {
+		addrs, e := ifcs[i].Addrs()
+		if e != nil {
+			continue
+		}
+		for _, a := range addrs {
+			netip, _, _ := net.ParseCIDR(a.String())
+			if netip.Equal(ip) {
+				return &ifcs[i], nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("no interface for %s", ip)
+}
+
+func defaultRouteInterface() (*net.Interface, error) {
+	out, e := exec.Command("ip", "route").Output()
+	if e != nil {
+		return nil, e
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "default") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "dev" && i+1 < len(fields) {
+				return net.InterfaceByName(fields[i+1])
+			}
+		}
+	}
+	return nil, errors.New("no default route")
+}
+
+// rebindTarget 决定当前该对外宣告哪个直连地址：优先 rpcd 写好的目标文件，
+// 其次默认路由所在口，最后退回配置的 LAN 口。只读，不写配置。
+func (d *daemon) rebindTarget() (string, *net.Interface, error) {
+	if b, e := os.ReadFile("/tmp/airsim-direct-host"); e == nil {
+		host := strings.TrimSpace(string(b))
+		if ip := net.ParseIP(host); ip != nil {
+			if ifc, e := interfaceForIP(ip); e == nil {
+				return host, ifc, nil
+			}
+		}
+	}
+	if ifc, e := defaultRouteInterface(); e == nil {
+		if host, e := privateIPv4(ifc); e == nil {
+			return host, ifc, nil
+		}
+	}
+	if ifc, e := net.InterfaceByName(d.ifname); e == nil {
+		if host, e := privateIPv4(ifc); e == nil {
+			return host, ifc, nil
+		}
+	}
+	return "", nil, errors.New("no usable direct address")
+}
+
+// rebind 运行期把 pair/control/PCM 监听与 Bonjour 主广告搬到新地址。
+// 先建新监听、成功再拆旧的；已建立的 TCP 连接不随 listener 关闭而断开。
+func (d *daemon) rebind(w http.ResponseWriter, r *http.Request) {
+	if !method(w, r, "POST") {
+		return
+	}
+	host, ifc, e := d.rebindTarget()
+	if e != nil {
+		write(w, 500, map[string]any{"error": "no usable direct address"})
+		return
+	}
+	d.netMu.Lock()
+	defer d.netMu.Unlock()
+	if host == d.lan {
+		write(w, 200, map[string]any{"ok": true, "host": host, "changed": false})
+		return
+	}
+	pairL, e1 := net.Listen("tcp", net.JoinHostPort(host, portText(d.settings.PairPort)))
+	ctrlL, e2 := net.Listen("tcp", net.JoinHostPort(host, portText(d.settings.ControlPort)))
+	pcmL, e3 := net.Listen("tcp", net.JoinHostPort(host, portText(d.settings.PCMPort)))
+	if e1 != nil || e2 != nil || e3 != nil {
+		pairL.Close()
+		ctrlL.Close()
+		pcmL.Close()
+		write(w, 500, map[string]any{"error": "bind new listeners failed", "detail": fmt.Sprint(e1, e2, e3)})
+		return
+	}
+	oldPair, oldCtrl, oldPcm := d.pairListener, d.ctrlListener, d.pcmListener
+	d.pairListener, d.ctrlListener, d.pcmListener = pairL, ctrlL, pcmL
+	d.lan = host
+	d.ifname = ifc.Name
+	go d.pairServer.Serve(pairL)
+	go d.ctrlServer.Serve(ctrlL)
+	go d.servePCM(d.ctx, pcmL)
+	_ = oldPair.Close()
+	_ = oldCtrl.Close()
+	_ = oldPcm.Close()
+
+	// 有进行中的配对会话时，advertisement 挂的是配对代理广告，不能顺手关掉；
+	// 主服务广告留到下次空闲再重注册。
+	d.mu.Lock()
+	sessionActive := d.session != nil
+	d.mu.Unlock()
+	if !sessionActive {
+		d.adMu.Lock()
+		if d.advertisement != nil {
+			d.advertisement.Shutdown()
+			d.advertisement = nil
+		}
+		txt := []string{
+			"v=1", "agent_id=" + d.deviceID, "agent_kind=mu300",
+			"device_name=AirSIM VIPME-M8", "manufacturer=ZTE", "model=VIPME-M8",
+			"host=" + host,
+			"control_port=" + portText(d.settings.ControlPort),
+			"pcm_port=" + portText(d.settings.PCMPort),
+			"caps=control,pcm",
+		}
+		suffix := d.deviceID
+		if len(suffix) > 8 {
+			suffix = suffix[len(suffix)-8:]
+		}
+		if ad, err := zeroconf.Register("AirSIM-VIPME-M8-"+suffix, "_airsim-vowlan._tcp", "local.", d.settings.ControlPort, txt, []net.Interface{*ifc}); err == nil {
+			d.advertisement = ad
+		} else {
+			log.Printf("rebind: bonjour re-register failed: %v", err)
+		}
+		d.adMu.Unlock()
+	}
+	log.Printf("rebind: direct listeners moved to %s (%s)", host, ifc.Name)
+	write(w, 200, map[string]any{"ok": true, "host": host, "changed": true})
+}
+
 func write(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -446,35 +632,6 @@ func (d *daemon) cancelPair(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, map[string]bool{"ok": true})
 }
 
-// pairClients lists the paired clients so the web UI can prune stale ones.
-func (d *daemon) pairClients(w http.ResponseWriter, r *http.Request) {
-	if !method(w, r, "GET") {
-		return
-	}
-	clients := d.gateway.Clients()
-	write(w, 200, map[string]any{"clients": clients, "total": len(clients), "limit": 16})
-}
-
-// pairRemove drops the selected entries. Body: {"indexes":[1,2]}.
-func (d *daemon) pairRemove(w http.ResponseWriter, r *http.Request) {
-	if !method(w, r, "POST") {
-		return
-	}
-	var body struct {
-		Indexes []int `json:"indexes"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
-		write(w, 400, map[string]string{"error": "invalid_request"})
-		return
-	}
-	removed, err := d.gateway.Remove(body.Indexes)
-	if err != nil {
-		write(w, 500, map[string]string{"error": "save_failed"})
-		return
-	}
-	remaining := d.gateway.Clients()
-	write(w, 200, map[string]any{"ok": true, "removed": removed, "total": len(remaining), "clients": remaining})
-}
 func (d *daemon) closePair(id string) {
 	d.adMu.Lock()
 	defer d.adMu.Unlock()
@@ -533,14 +690,21 @@ func (d *daemon) claim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer clear(plaintext)
+	// Open 已消费本次配对码：注册或持久化随后失败也要立即关掉窗口，
+	// 不让用过的码被当成可重用；不重开、不重放注册。
+	defer d.closePair(s.ID)
 	var reg map[string]any
 	if json.Unmarshal(plaintext, &reg) != nil {
 		write(w, 400, map[string]string{"error": "invalid_registration"})
 		return
 	}
 	localSecret, _ := reg["vowlan_secret"].(string)
-	if d.gateway == nil || d.gateway.CheckAdd(localSecret) != nil {
+	if d.gateway == nil {
 		write(w, 500, map[string]string{"error": "gateway_key_storage_failed"})
+		return
+	}
+	if d.gateway.CheckAdd(localSecret) != nil {
+		write(w, 400, map[string]string{"error": "invalid_registration", "message": "配对密钥格式无效，请更正后重新获取配对码。"})
 		return
 	}
 	prepareRegistration(reg, d.deviceID)
@@ -583,7 +747,6 @@ func (d *daemon) claim(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	d.paired = true
 	d.mu.Unlock()
-	d.closePair(s.ID)
 	write(w, 200, result)
 }
 

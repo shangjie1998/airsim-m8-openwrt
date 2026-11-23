@@ -1,0 +1,170 @@
+#!/bin/sh
+# 5.4 厂商内核专用：客户端（连本机热点的手机 / 电脑）"无互联网"体检与修复。
+#
+# 症状：设备自身能上网（LuCI、ping、curl 都正常），但连热点的客户端显示"无互联网"。
+# 根因：fw4 生成的 flowtable 里含 sipa_eth0（SIPA 委托出来的自定义 ARPHRD 虚拟口），
+#       5.4 内核在整表事务里建这个 flowtable 会失败 → 整张防火墙表拒绝加载；
+#       跑的还是开机 S19 那版（那时 br-lan / sipa_eth0 还没建）→ accept_to_wan 为空，
+#       forward 的 policy 是 drop → 客户端包全被丢。设备自身走 output 链，所以"设备能上网、客户端不能"。
+#
+# 修法：flow_offloading=0，fw4 不再生成 flowtable，事务冲突从源头消失。
+#       代价只是转发不走快路径，LTE 几十兆量级用 CPU 转发看不出差别。
+# 6.18 / 7.3 上这个问题不存在（实测 flow_offloading=1 也正常），所以脚本会直接 skip。
+#
+# 用法（root）：
+#   airsim-flowfix --check   只体检，不动任何配置
+#   airsim-flowfix --fix     体检 + 修 + 复验
+#   airsim-flowfix --restore 把 flow_offloading 按回 1（恢复 OpenWrt 默认；要换内核 / 想留原样时用）
+# 输出最后一行固定是 RESULT=ok / need_fix / fixed / skip / error，供 ubus 后端解析。
+
+set -u
+
+mode=check
+case "${1:-}" in
+--check | check) mode=check ;;
+--fix | fix) mode=fix ;;
+--restore | restore) mode=restore ;;
+--help | -h) printf 'Usage: %s --check | --fix | --restore\n' "$0"; exit 0 ;;
+*) printf 'ERROR: 未知参数 %s，用 --check / --fix / --restore\n' "${1}" >&2; exit 2 ;;
+esac
+
+say() { printf '%s\n' "$*"; }
+fail() { printf 'ERROR: %s\n' "$*" >&2; printf 'RESULT=error\n'; exit 1; }
+
+# 让 fw4 重新生成规则。优先 reload：5.4 + flow_offloading=1 时 `fw4 restart` 的渲染检查会因为
+# flowtable 建不起来（Resource busy）直接拒绝整表，rc=1 但 reload 能过。所以不能只看 rc，之后按实际状态判定。
+apply_fw() {
+	if /etc/init.d/firewall reload >/dev/null 2>&1; then
+		sleep 2
+		return 0
+	fi
+	/etc/init.d/firewall restart >/dev/null 2>&1 || true
+	sleep 2
+	return 0
+}
+
+[ "$(id -u)" = 0 ] || fail '请以 root 执行'
+
+krel5=$(uname -r | cut -d. -f1,2)
+if [ "$mode" = restore ]; then
+	say '把 flow_offloading 按回 1（OpenWrt 默认），并重启防火墙。'
+	uci set firewall.@defaults[0].flow_offloading='1'
+	uci commit firewall
+	apply_fw
+	[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = 1 ] || fail '写进去了但读回来不是 1'
+	say "  flow_offloading=$(uci -q get firewall.@defaults[0].flow_offloading)"
+	ftn=$(nft list flowtables inet fw4 2>/dev/null | grep -c 'flowtable ft' || true)
+	say "  flowtable 对象：$ftn 个"
+	if nft list flowtables inet fw4 2>/dev/null | grep -q 'sipa_eth0'; then
+		say '  ⚠ 注意：flowtable 里已经出现 sipa_eth0，5.4 上这时整张表会加载失败，客户端可能没网'
+	else
+		say '  OK flowtable 里没有 sipa_eth0'
+	fi
+	if [ "$krel5" = 5.4 ]; then
+		say ''
+		say '⚠ 5.4 上开 1 是有风险的：实测 fw4 会因为 flowtable 建不起来（Resource busy）而拒绝整表，'
+		say '  重启后防火墙可能起不来（设备自身还能上网，但客户端全断）。要么保持 0，要么确认切到 6.18 再开。'
+	fi
+	say 'RESULT=restored'
+	exit 0
+fi
+
+krel=$(uname -r | cut -d. -f1,2)
+say "KERNEL=$krel  ($(uname -r))"
+if [ "$krel" != "5.4" ]; then
+ say '这个内核不需要本修复（flowtable 与 sipa_eth0 的事务冲突只在 5.4 厂商内核上出现）。'
+ say 'RESULT=skip'
+ exit 0
+fi
+
+need=0
+advise=0
+
+say ''
+say '== 1. 拨号 / 上行 =='
+up=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null || echo unknown)
+l3=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null || echo unknown)
+say "  wan.up=$up  l3_device=$l3"
+[ "$up" = true ] || say '  ⚠ wan 没起来：先解决拨号（热点要走上行流量才谈得上客户端上网）'
+
+say ''
+say '== 2. 设备自身出网 =='
+if ping -c 2 -W 4 223.5.5.5 >/dev/null 2>&1; then
+ say '  OK 设备自身出网正常'
+else
+ say '  ⚠ 设备自身也不通：先修拨号 / DNS，再回来跑这个'
+fi
+
+say ''
+say '== 3. 软件流卸载开关 =='
+offload=$(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null || echo '?')
+say "  flow_offloading=$offload （5.4 上建议设成 0：一旦切到「流量」模式，sipa_eth0 就会进 flowtable 把整张表打废）"
+[ "$offload" = 0 ] || advise=1
+
+say ''
+say '== 4. flowtable 里有没有 sipa_eth0（真正的雷）=='
+ft=$(nft list flowtables inet fw4 2>/dev/null || true)
+if printf '%s\n' "$ft" | grep -q 'sipa_eth0'; then
+ say '  ⚠ flowtable 里含 sipa_eth0 —— 5.4 上这张表必加载失败：'
+ printf '%s\n' "$ft" | sed 's/^/    /'
+ need=1
+elif printf '%s\n' "$ft" | grep -q 'flowtable ft '; then
+ say '  有 flowtable，但只含普通网口（不含 sipa_eth0），5.4 上不会触发整表失败：'
+ printf '%s\n' "$ft" | sed 's/^/    /'
+else
+ say '  OK 没有 flowtable 对象'
+fi
+
+say ''
+say '== 5. wan 方向规则是否真的加载 =='
+if [ "$up" = true ]; then
+ acc=$(nft list chain inet fw4 accept_to_wan 2>/dev/null | grep -c 'sipa_eth0' || true)
+ if [ "$acc" -ge 1 ]; then
+  say "  OK accept_to_wan 里有 sipa_eth0（$acc 条）"
+ else
+  say '  ⚠ 蜂窝在跑但 accept_to_wan 为空 → 整表没加载成功'
+  need=1
+ fi
+else
+ say '  当前蜂窝没起来（wan.up 不是 true），accept_to_wan 为空是正常的，不算问题'
+ say '  只有走「流量」模式才需要这一项'
+fi
+nat=$(nft list chain inet fw4 srcnat_wan 2>/dev/null | grep -c masquerade || true)
+say "  srcnat_wan masquerade 规则：$nat 条（正常是 2：v4 + v6）"
+
+if [ "$mode" = check ]; then
+ say ''
+ if [ "$need" = 1 ]; then
+  say '结论：已经坏了，需要修复。点「修复」或跑 airsim-flowfix --fix。'
+  say 'RESULT=need_fix'
+ elif [ "$advise" = 1 ]; then
+  say '结论：现在还没坏（蜂窝没在跑，flowtable 里没 sipa_eth0），但开关是开的，'
+  say '      一旦切「流量」模式就会踩雷。建议先关掉，省得现场抓瞎。'
+  say 'RESULT=suggest'
+ else
+  say '结论：当前没这个问题，不用动。'
+  say 'RESULT=ok'
+ fi
+ exit 0
+fi
+
+say ''
+say '== 修复：关掉软件流卸载并重启防火墙 =='
+uci set firewall.@defaults[0].flow_offloading='0'
+uci commit firewall
+apply_fw
+
+say '== 复验 =='
+if nft list flowtables inet fw4 2>/dev/null | grep -q 'flowtable ft '; then
+ fail '重启后仍有 flowtable，修复没生效'
+fi
+say '  OK 没有 flowtable 了'
+acc2=$(nft list chain inet fw4 accept_to_wan 2>/dev/null | grep -c 'sipa_eth0' || true)
+say "  accept_to_wan 里 sipa_eth0：$acc2 条"
+if nft list chain inet fw4 forward 2>/dev/null | grep -q 'policy drop'; then
+ say '  forward 策略仍是 drop，正常（放行靠 accept_to_wan）'
+fi
+say ''
+say '完成。客户端断开重连一次热点即可（DHCP 租约不用换）。'
+say '注意：别在 LuCI 防火墙页再勾「软件流量分载」，一勾这个坑就回来。'
+say 'RESULT=fixed'

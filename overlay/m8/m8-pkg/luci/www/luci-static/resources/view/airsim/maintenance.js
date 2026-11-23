@@ -3,6 +3,7 @@
 'require poll';
 'require rpc';
 'require view.airsim.ui as ui';
+'require view.airsim.glass as glass';
 
 var getStatus = rpc.declare({ object: 'airsim', method: 'status', expect: {}, reject: true });
 var getDiagnostics = rpc.declare({ object: 'airsim', method: 'diagnostics', expect: {}, reject: true });
@@ -252,17 +253,22 @@ return view.extend({
 
   showUpdateStatus(updateInfo);
 
-  var backupCard = E('section', { 'class': 'as-card as-wide' }, [
-   E('h3', {}, '备份与恢复'),
-   E('p', { 'class': 'as-copy', style: 'margin-top:8px' }, '把插件配置、配对凭据和运行状态打成一个 .tar.gz 存到电脑；换固件、刷机、折腾完再导回来。'),
-   E('p', { 'class': 'as-caption' }, '备份包按本机硬件指纹标记，恢复时先校验指纹，别人的备份会被直接拒绝。日志、音频、短信正文都不进包。'),
+  /* 备份、恢复分两张卡：一件事一张卡，宽屏并排，窄屏上下 */
+  var backupCard = E('section', { 'class': 'as-card' }, [
+   E('h3', {}, '备份'),
+   E('p', { 'class': 'as-copy as-lead' }, '把插件配置、配对凭据和运行状态打成一个 .tar.gz 存到电脑。'),
+   E('p', { 'class': 'as-caption' }, '备份包按本机硬件指纹标记；日志、音频、短信正文都不进包。'),
    E('div', { 'class': 'as-buttons' }, [backupBtn]),
-   backupNote,
-   E('hr', {}),
+   backupNote
+  ]);
+
+  var restoreCard = E('section', { 'class': 'as-card' }, [
+   E('h3', {}, '恢复'),
+   E('p', { 'class': 'as-copy as-lead' }, '换固件、刷机、折腾完再导回来；先校验指纹，别人的备份会被直接拒绝。'),
    dropZone, fileInput, pickButton, pickedName,
    E('div', { 'class': 'as-buttons' }, [restoreBtn]),
    restorePanel,
-   E('p', { 'class': 'as-caption', style: 'margin-top:10px' }, '恢复会覆盖当前配置与配对资料并重启服务，覆盖前自动把现在的状态存到 /tmp/airsim-before-restore-*。')
+   E('p', { 'class': 'as-caption as-lead' }, '恢复会覆盖当前配置与配对资料并重启服务，覆盖前自动把现在的状态存到 /tmp/airsim-before-restore-*。')
   ]);
 
   var updateCard = E('section', { 'class': 'as-card as-wide' }, [
@@ -277,7 +283,7 @@ return view.extend({
 
   var diagCard = E('section', { 'class': 'as-card' }, [
    E('h3', {}, '诊断导出'),
-   E('p', { 'class': 'as-copy', style: 'margin-top:8px' }, '导出一份可分享的状态报告，出问题时直接发给维护的人。'),
+   E('p', { 'class': 'as-copy as-lead' }, '导出一份可分享的状态报告，出问题时直接发给维护的人。'),
    E('p', { 'class': 'as-caption' }, '不读取短信正文，不导出号码、IP、Relay 地址、标识、配对码、密钥、原始日志或音频；不会自动上传。'),
    E('div', { 'class': 'as-buttons' }, [diagBtn]),
    diagNote
@@ -301,11 +307,13 @@ return view.extend({
 
   return E('div', { 'class': 'as-root' }, [
    ui.stylesheet(),
+   E('style', {}, glass.css()),
+   (ui.menu ? ui.menu('maintenance') : ''),
    E('header', { 'class': 'as-header' }, [
     E('div', {}, [E('div', { 'class': 'as-eyebrow' }, 'AirSIM · 维护'), E('h2', {}, '备份、更新、诊断。'), E('p', {}, '折腾完想回退的时候，这里能救回来。')]),
     E('span', { 'class': 'as-version' }, 'v' + (state.version || '—'))
    ]),
-   E('div', { 'class': 'as-layout' }, [backupCard, updateCard, diagCard, versionCard]),
+   E('div', { 'class': 'as-layout' }, [backupCard, restoreCard, updateCard, diagCard, versionCard]),
    E('footer', { 'class': 'as-footer' }, 'AirSIM for VIPME-M8 · 维护')
   ]);
  },

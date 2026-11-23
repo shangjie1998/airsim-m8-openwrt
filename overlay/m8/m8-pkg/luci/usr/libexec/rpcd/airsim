@@ -145,7 +145,7 @@ backup_restore() {
 }
 case "$1" in
 list)
-	printf '%s\n' '{"status":{},"settings_get":{},"settings_save":{"config":""},"diagnostics":{},"updates":{"previews":true},"updates_status":{},"updates_policy":{"config":""},"update_install":{"tag":""},"pair_start":{},"pair_cancel":{},"pair_clients":{},"pair_remove":{"indexes":""},"number_refresh":{},"start":{},"stop":{},"call_action":{"action":"","number":"","call_id":"","operation_id":"","card":""},"backup_make":{},"backup_restore":{"payload":""}}'
+	printf '%s\n' '{"status":{},"settings_get":{},"settings_save":{"config":""},"diagnostics":{},"updates":{"previews":true},"updates_status":{},"updates_policy":{"config":""},"update_install":{"tag":""},"pair_start":{},"pair_cancel":{},"pair_clients":{},"pair_remove":{"ids":""},"number_refresh":{},"start":{},"stop":{},"call_action":{"action":"","number":"","call_id":"","operation_id":"","card":""},"backup_make":{},"backup_restore":{"payload":""}}'
 	;;
 call)
 	case "$2" in
@@ -223,11 +223,48 @@ call)
 		;;
 	pair_remove)
 		IFS= read -r request
-		if ! json_load "$request"; then printf '%s\n' '{"error":"无效请求"}'; exit 0; fi
-		json_get_var indexes indexes
-		indexes=$(printf '%s' "$indexes" | tr -cd '0-9,')
-		if [ -z "$indexes" ]; then printf '%s\n' '{"error":"未选择要删除的客户端"}'; exit 0; fi
-		wget -q -T 8 --post-data="{\"indexes\":[$indexes]}" -O - http://127.0.0.1:7581/pair/remove || printf '%s\n' '{"error":"AirSIM service is stopped"}'
+		ids=''
+		if json_load "$request" 2>/dev/null; then
+			json_get_var ids ids
+		fi
+		ids=$(printf '%s' "$ids" | tr -cd '0-9a-f,')
+		if [ -z "$ids" ]; then
+			printf '%s\n' '{"ok":false,"error":"未选择要删除的客户端"}'
+			exit 0
+		fi
+		removed=0
+		errmsg=''
+		for id in $(printf '%s' "$ids" | tr ',' ' '); do
+			[ -z "$id" ] && continue
+			# 指纹必须是 64 位小写 hex；其余一律拒绝，不把脏值发给 Go。
+			if [ ${#id} -ne 64 ] || [ -n "$(printf '%s' "$id" | tr -d '0-9a-f')" ]; then
+				errmsg='配对标识无效，请刷新列表'
+				continue
+			fi
+			resp=$(wget -q -T 5 --post-data="{\"id\":\"$id\"}" -O - http://127.0.0.1:7581/pair/remove 2>/dev/null)
+			case "$resp" in
+				*'"ok":true'*)
+					removed=$((removed + 1))
+					;;
+				*)
+					[ -z "$errmsg" ] && errmsg=$(printf '%s' "$resp" | jsonfilter -e '@.error' 2>/dev/null)
+					[ -z "$errmsg" ] && errmsg='未能移除配对，请确认音频会话已结束且设备存储可写'
+					;;
+			esac
+		done
+		if [ "$removed" -eq 0 ]; then
+			json_init
+			json_add_boolean ok 0
+			json_add_string error "$errmsg"
+			json_dump
+			exit 0
+		fi
+		remaining=$(wget -q -T 4 -O - http://127.0.0.1:7581/pair/clients 2>/dev/null | jsonfilter -e '@.clients[*]' 2>/dev/null | grep -c .)
+		json_init
+		json_add_boolean ok 1
+		json_add_int removed "$removed"
+		json_add_int total "$remaining"
+		json_dump
 		;;
 	number_refresh)
 		wget -q -T 10 --post-data='{}' -O - http://127.0.0.1:7581/number/refresh || printf '%s\n' '{"error":"无法读取号码，请检查服务状态"}'
